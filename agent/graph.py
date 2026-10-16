@@ -1,0 +1,157 @@
+"""LangGraph 编排：最小 ReAct 循环（agent → tools → agent …）+ 最大步数上限 + trace 埋点。
+
+为什么用 StateGraph 手写循环，而不是一行 `create_react_agent(...)`：
+- **最大步数要可控**：框架的 `recursion_limit` 是「图步数」的兜底保护，不等于业务上的
+  「最多思考几轮」；本项目把业务上限做进路由函数（`max_steps`），到点强制收尾；
+- **失败处理要显式**：工具执行节点的每一步都要被 trace 记录、要能重试/降级/熔断，
+  这需要自己的执行层（见 `resilience.py`），而不是框架内建的「把错误字符串塞回去」；
+- **状态要说得清**：`messages` + `steps` + `status` 三个字段就是全部状态，
+  面试问「状态存在哪里」时可以一行一行指出来。
+
+图结构：
+    START → agent ──(有 tool_calls 且未超步数)→ tools → agent → … → END
+                 └──(无 tool_calls / 超步数 / 模型故障)→ END
+"""
+
+import time
+from typing import Annotated, Any, Dict, List, TypedDict
+
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import AIMessage, AnyMessage, SystemMessage, ToolMessage
+from langgraph.graph import END, START, StateGraph
+from langgraph.graph.message import add_messages
+
+from agent.resilience import ToolExecutor
+from agent.trace import Tracer
+
+
+class AgentState(TypedDict):
+    """图的全部状态。
+
+    - messages：对话与工具消息（`add_messages` 表示新消息追加而不是覆盖）；
+    - steps：已经走了几轮「模型思考」——最大步数限制的依据；
+    - status：new / in_progress / completed / llm_error。
+    """
+
+    messages: Annotated[List[AnyMessage], add_messages]
+    steps: int
+    status: str
+
+
+def _text_of(message: AnyMessage) -> str:
+    """把消息内容取成字符串（内容可能是 str 或内容块列表）。"""
+    content = getattr(message, "content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict):
+                parts.append(str(block.get("text", block)))
+            else:
+                parts.append(str(block))
+        return "\n".join(parts)
+    return str(content)
+
+
+def build_agent_graph(
+    llm: BaseChatModel,
+    executor: ToolExecutor,
+    tracer: Tracer,
+    config: Dict[str, Any],
+):
+    """构建并编译 ReAct 图。"""
+    max_steps = int(config["agent"]["max_steps"])
+    system_prompt = str(config["agent"]["system_prompt"])
+
+    # ★ 关键一步：把工具 schema 绑定到模型。
+    # 框架版（create_react_agent / create_agent）会自动做这件事，手写循环必须显式绑定，
+    # 否则模型完全不知道工具存在 —— 它会「凭记忆直答」，而且答案看起来还挺像样，
+    # 属于非常隐蔽的错误（第一版就是这样漏掉的，见 README「踩坑记录」）。
+    tools = list(executor.tools.values())
+    if tools:
+        llm = llm.bind_tools(tools)
+
+    # ---------- 节点 1：模型思考 ----------
+    async def agent_node(state: AgentState) -> Dict[str, Any]:
+        tracer.next_step()
+        step = tracer.step
+        messages = [SystemMessage(content=system_prompt)] + list(state["messages"])
+
+        started = time.perf_counter()
+        try:
+            ai_message: AIMessage = await llm.ainvoke(messages)
+        except Exception as exc:  # noqa: BLE001 —— 模型侧故障不能让整个流程抛出去
+            elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
+            tracer.event("llm_call", elapsed_ms=elapsed_ms, ok=False, error=f"{type(exc).__name__}: {exc}")
+            fallback_text = (
+                f"[模型调用失败] {type(exc).__name__}: {exc}\n"
+                "（已按配置重试 llm.max_retries 次；这一步没有产生任何工具调用）"
+            )
+            return {
+                "messages": [AIMessage(content=fallback_text)],
+                "steps": state.get("steps", 0) + 1,
+                "status": "llm_error",
+            }
+
+        elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
+        usage = getattr(ai_message, "usage_metadata", None) or {}
+        tracer.event(
+            "llm_call",
+            elapsed_ms=elapsed_ms,
+            ok=True,
+            usage={
+                "input_tokens": usage.get("input_tokens"),
+                "output_tokens": usage.get("output_tokens"),
+                "total_tokens": usage.get("total_tokens"),
+            } if usage else None,
+        )
+
+        tool_calls = [
+            {"name": call.get("name"), "args": call.get("args") or {}}
+            for call in (getattr(ai_message, "tool_calls", None) or [])
+        ]
+        tracer.event("thought", content=_text_of(ai_message), tool_calls=tool_calls)
+
+        status = "completed" if not tool_calls else "in_progress"
+        return {
+            "messages": [ai_message],
+            "steps": state.get("steps", 0) + 1,
+            "status": status,
+        }
+
+    # ---------- 节点 2：执行工具 ----------
+    async def tools_node(state: AgentState) -> Dict[str, Any]:
+        last = state["messages"][-1]
+        tool_messages: List[ToolMessage] = []
+        # 同一轮的多个工具调用按顺序执行：便于 trace 归因；工具集小，串行的额外成本可忽略
+        for call in getattr(last, "tool_calls", None) or []:
+            outcome = await executor.execute(call["name"], call.get("args") or {})
+            tool_messages.append(
+                ToolMessage(
+                    content=outcome.to_observation(),
+                    tool_call_id=call.get("id") or "",
+                    name=call.get("name") or "unknown",
+                )
+            )
+        return {"messages": tool_messages, "status": "in_progress"}
+
+    # ---------- 路由：决定继续调工具还是收尾 ----------
+    def route_after_agent(state: AgentState) -> str:
+        if state.get("status") in ("completed", "llm_error"):
+            return "end"
+        last = state["messages"][-1]
+        if not getattr(last, "tool_calls", None):
+            return "end"
+        if state.get("steps", 0) >= max_steps:
+            # 步数用尽：不再执行工具（否则第 max_steps+1 轮的观察永远没机会被消化）
+            return "end"
+        return "tools"
+
+    graph = StateGraph(AgentState)
+    graph.add_node("agent", agent_node)
+    graph.add_node("tools", tools_node)
+    graph.add_edge(START, "agent")
+    graph.add_conditional_edges("agent", route_after_agent, {"tools": "tools", "end": END})
+    graph.add_edge("tools", "agent")
+    return graph.compile()

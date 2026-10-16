@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# ★ 密钥文件：只提交 .env.example，绝不提交 .env
+.env
+
+# 日志/缓存
+*.log
+logs/

@@ -1,0 +1,53 @@
+# hello-agent 配置文件（行为参数；密钥在 .env 里，不进仓库）
+
+llm:
+  temperature: 0.0        # Agent 要可复现：温度尽量低
+  timeout_s: 60           # 单次模型调用超时
+  max_retries: 2          # 模型 HTTP 层重试（网络抖动/限流）——与工具层重试相互独立
+
+agent:
+  max_steps: 6            # ★ 业务上的最大步数：一轮 = 模型思考 + 工具执行
+  recursion_limit: 25     # LangGraph 图步数兜底（防御性上限，正常远达不到）
+  system_prompt: |
+    你是一个严谨的助手，可以调用工具。规则：
+    1) 需要事实依据时先检索知识库（search_knowledge），基于返回片段回答，不要凭记忆编造；
+    2) 需要算术时调用 calculator，不要心算；需要当前时间调用 current_time；
+    3) 如果工具返回错误或空结果，先判断能否换参数/换工具重试一次，仍不行就如实说明「查不到」，不要编答案；
+    4) 回答用中文，简洁，必要时说明依据来自哪个来源文件。
+
+tools:
+  timeout_s: 20           # 单次工具调用超时（超时算可重试失败）
+  retry:
+    max_attempts: 3       # 可重试失败的最大尝试次数
+    backoff_base_s: 0.5   # 指数退避基数：0.5s → 1s → 2s（上限 backoff_max_s）
+    backoff_max_s: 4.0
+    retryable_patterns:   # 命中这些关键词的异常按「可重试」处理
+      - "timeout"
+      - "timed out"
+      - "connection"
+      - "connect"
+      - "temporarily"
+      - "rate limit"
+      - "429"
+      - "502"
+      - "503"
+      - "504"
+  circuit_breaker:
+    failure_threshold: 3  # 同一工具连续失败达到该次数 → 本任务内熔断（告知模型不要再调）
+  rag:
+    mode: "auto"          # auto（先 MCP，连不上自动降级直连）| mcp | direct
+    mcp:
+      # 指向 rag-mcp-server 仓库的 venv python 与 server.py（stdio 子进程）
+      server_command: "../rag-mcp-server/.venv/Scripts/python.exe"
+      server_script: "../rag-mcp-server/server.py"
+      cwd: "../rag-mcp-server"
+      connect_timeout_s: 60
+    direct:
+      # 降级/轻量形态：把 rag-mcp-server 仓库加进 sys.path，进程内直连同源检索
+      repo_path: "../rag-mcp-server"
+      config_path: "config.yaml"
+
+trace:
+  dir: "./traces"         # 每次任务一个 JSONL 文件
+  console: "summary"      # summary（逐步摘要）| verbose（含最终回答）| quiet
+  preview_chars: 200      # 控制台/文件里单条文本的预览长度上限

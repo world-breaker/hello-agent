@@ -1,0 +1,29 @@
+# hello-agent 依赖（版本为实测通过验证的固定版本，2026-10-16 / Python 3.12.9 / Windows）
+
+# Agent 编排与 LLM 客户端
+langgraph==1.2.15
+langgraph-prebuilt==1.1.1
+langchain==1.4.6
+langchain-core==1.6.11
+langchain-openai==1.7.2
+
+# MCP 客户端（把 rag-mcp-server 的 search_knowledge 接成工具）
+# 注意：该包目前要求 mcp<2，因此这里固定为 1.30.0；服务端 rag-mcp-server 用的是 mcp 2.x，
+#       两者靠协议本身互通（详见 README「RAG 工具的两种形态」）
+langchain-mcp-adapters==0.3.2
+mcp==1.30.0
+
+# 配置与密钥
+python-dotenv==1.2.4
+PyYAML==6.0.3
+tzdata==2026.5
+
+# 测试
+pytest==9.1.1
+
+# ── 以下仅「RAG 直连形态 / 降级路径」需要（mode=direct，或 MCP 通道故障后的降级）──
+# 不装也能跑 MCP 形态（推荐用法），装了才能进程内直连检索
+numpy==2.5.4
+sentence-transformers==5.7.0
+transformers==5.20.0
+torch==2.14.1

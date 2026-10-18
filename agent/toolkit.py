@@ -15,6 +15,7 @@ from typing import Any, Callable, Dict, List
 
 from langchain_core.tools import BaseTool
 
+from agent.memory import MemoryStore, build_memory_tools
 from agent.rag_tool import (
     SEARCH_TOOL_NAME,
     make_direct_fallback,
@@ -32,6 +33,7 @@ class ToolSet:
     rag_mode: str = "none"  # mcp | direct | none
     rag_note: str = ""
     tool_names: List[str] = field(default_factory=list)
+    memory: MemoryStore | None = None  # 跨任务长期记忆（未启用时为 None）
 
 
 @asynccontextmanager
@@ -44,6 +46,24 @@ async def build_toolset(
     async with AsyncExitStack() as stack:
         toolset = ToolSet()
         toolset.tools.update(build_builtin_tools(config))
+
+        # 跨任务长期记忆：默认启用；记录 run_id 便于追溯「这条记忆是哪个任务写下的」
+        memory_cfg = config.get("memory", {}) or {}
+        if bool(memory_cfg.get("enabled", True)):
+            store = MemoryStore(config)
+            store.run_id = tracer.run_id
+            toolset.memory = store
+            if bool(memory_cfg.get("tools", True)):
+                toolset.tools.update(build_memory_tools(store))
+            tracer.event(
+                "memory_ready",
+                enabled=True,
+                path=str(store.path),
+                records=len(store),
+                tools=["remember_fact", "recall_memory"]
+                if bool(memory_cfg.get("tools", True))
+                else [],
+            )
 
         rag_cfg = config["tools"]["rag"]
         mode = (rag_mode_override or str(rag_cfg["mode"])).lower()

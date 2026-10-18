@@ -218,8 +218,11 @@ flowchart TB
 | `knowledge_base_stats` | — | JSON：文档数 / chunk 数 / 来源文件 / 阈值 / 模型 | 同样来自 MCP Server（**只接入 MCP 形态时存在**，direct 形态没有它） |
 | `calculator` | `expression` | JSON：`{ok, result}` 或 `{ok:false, error, hint}` | AST 白名单：数字、`+ - * / // % **`、`sqrt/log/exp/abs/round/min/max/pow/sin/cos/tan`；**无 `eval`**、禁止属性访问/导入/下标/字符串运算 |
 | `current_time` | — | JSON：`date/time/weekday/human` | 时区在构造时固定为 `Asia/Shanghai`，**模型无法传入任意时区字符串** |
+| `remember_fact` | `content`, `key=""`, `tags=""` | JSON：`{ok, key, total}` | **跨任务长期记忆**：写入 JSONL；同 key 覆盖；拒绝疑似密钥 |
+| `recall_memory` | `query`, `top_k=5` | JSON：`{ok, count, results[{key, content, tags, score}]}` | 按字面重叠召回历史记忆；没命中就返回空（不编造） |
 
-三个工具都在贯彻同一件事：**把模型当作不可信输入源**——参数只走受控通道，错误变成可读反馈而不是崩溃。
+这些工具都在贯彻同一件事：**把模型当作不可信输入源**——参数只走受控通道，错误变成可读反馈而不是崩溃。
+（`remember_fact` / `recall_memory` 由 `memory.tools: true` 控制是否注册，见 §5.5。）
 
 ### RAG 工具的两种形态
 
@@ -281,7 +284,7 @@ copy .env.example .env
 
 ---
 
-## 5. 可靠性设计（本项目的重点）
+## 5. 可靠性设计与能力增强（本项目的重点）
 
 ### 5.1 失败分类与处置
 
@@ -326,6 +329,93 @@ status: str                                          # new / in_progress / compl
 错误怎么回灌、状态放哪里」这些可讲之处。手写的代价约 100 行编排代码，换来的是：
 业务步数上限（`max_steps`）与图步数兜底（`recursion_limit=25`）语义分离、
 每个工具调用都过自己的执行层、每一步都被 trace 覆盖。
+
+### 5.4 工具调用并发化
+
+模型一轮可能同时返回多个**互不依赖**的 `tool_calls`（例如「查知识库 + 算一下 + 现在几点」）。
+串行执行会把延迟累加；并发执行的总延迟约等于**最慢的那个工具**。
+
+实现（`agent/graph.py` 的 `tools_node`）：
+
+```python
+sem = asyncio.Semaphore(max_parallel_tools)
+async def _run(call):
+    async with sem:                    # 限制并发，防止一次吐出几十个调用打爆依赖
+        return await executor.execute(call["name"], call["args"])
+
+outcomes = await asyncio.gather(*(_run(c) for c in calls))
+# gather 保持输入顺序 → ToolMessage 与 tool_calls 一一对应（协议要求）
+```
+
+配置：
+
+```yaml
+agent:
+  parallel_tools: true      # 关闭则退回串行（保留原行为）
+  max_parallel_tools: 4     # Semaphore 并发上限
+```
+
+为什么安全 / 可解释：
+
+- `asyncio.gather` **保持输入顺序**，`ToolMessage.tool_call_id` 仍与请求一一对应；
+- trace 新增 `parallel_tools` / `parallel_tools_done` 事件，记录这批调用的工具名与总耗时；
+  单条 `action/observation` 仍带 `tool` 名，可归因；
+- `ToolExecutor` 的重试/熔断状态是**单任务、单事件循环**内的，`stats` 自增不会丢更新；
+- 有共享可变状态或严格限流的工具，建议 `parallel_tools: false`。
+
+实测（`tests/test_parallel_tools.py`）：4 个各 sleep 0.2s 的工具，并发 ≈0.2s，串行 ≈0.8s；
+测试同时断言输出顺序与 tool_calls 顺序一致。
+
+### 5.5 跨任务长期记忆
+
+**问题**：`messages` 只在本次任务内有效，任务结束就丢了。用户上次说「记住：我的默认语言是中文」，
+下次任务不应该重新交代。
+
+**设计**（`agent/memory.py`）：
+
+```
+任务开始
+  └─ MemoryStore 从 JSONL 加载（同 key 以最后一条为准）
+  └─ recall(task) 按字面重叠召回 top-k
+  └─ build_memory_context() 拼成一段文本 → 追加到 system prompt
+任务进行中
+  └─ 模型可调用 remember_fact(content, key?, tags?) 主动写
+  └─ 模型可调用 recall_memory(query, top_k?) 显式查
+任务结束
+  └─ 已写入的记忆落盘，下个任务/下个进程仍可读
+```
+
+关键取舍：
+
+| 决策 | 为什么 |
+|---|---|
+| **JSONL 追加写** | 一行一条，崩溃最多丢最后一行；便于 `grep` / `jq` / 人工排查 |
+| **同 key 后写覆盖** | 不引入数据库就获得 upsert 语义；读取时只保留最新视图 |
+| **字面召回（英文词 + 中文单字/二元组）** | 记忆通常几十~几百条，零依赖、可解释、离线可跑；语义召回可再接 embedding（与 rag-eval 混合检索同思路） |
+| **只注入命中的 top-k** | 与任务无关键词重叠就不注入，避免把无关记忆塞进 prompt |
+| **拒绝疑似密钥** | 记忆是长期落盘的，`sk-` / `API_KEY=` 直接拒绝，避免把密钥写进磁盘 |
+
+配置（`config.yaml`）：
+
+```yaml
+memory:
+  enabled: true
+  path: "./data/agent_memory.jsonl"
+  tools: true                 # 注册 remember_fact / recall_memory
+  inject_top_k: 3             # 任务启动自动注入的条数
+  max_inject_chars: 800       # 注入长度上限（控上下文成本）
+  max_content_chars: 2000
+  max_records: 2000           # 超过后自动 compact（同 key 只留最新）
+```
+
+离线演示（不需要 API key / 模型）：
+
+```bash
+.venv\Scripts\python.exe scripts\demo_memory.py --reset
+```
+
+输出会展示：任务 A 写入 2 条记忆 → 任务 B 自动召回并拼出注入文本 → 无关问题不注入。
+单元测试见 `tests/test_memory.py`（7 条：持久化、同 key 覆盖、拒绝密钥、无重叠不召回、工具往返、注入截断、禁用）。
 
 ---
 
@@ -445,21 +535,28 @@ status: str                                          # new / in_progress / compl
 ```text
 hello-agent/
 ├── run.py                     # 命令行入口（单任务）
-├── config.yaml                # 行为参数：max_steps / 重试 / 熔断 / RAG 形态 / trace
+├── config.yaml                # 参数：max_steps / 并发 / 重试 / 熔断 / 记忆 / RAG 形态 / trace
 ├── .env.example               # 端点配置模板（.env 在 .gitignore，永不入库）
 ├── requirements.txt           # 固定版本依赖
 ├── agent/
 │   ├── config.py              # 配置加载 + 密钥脱敏
 │   ├── llm.py                 # OpenAI 兼容端点装配
-│   ├── graph.py               # ★ LangGraph 编排：两节点 + 路由 + 状态
+│   ├── graph.py               # ★ LangGraph 编排：两节点 + 路由 + 并发工具 + 记忆注入
 │   ├── resilience.py          # ★ 工具执行层：超时/重试/降级/熔断/限长
 │   ├── tools_builtin.py       # 计算器（AST 白名单）+ 当前时间
 │   ├── rag_tool.py            # ★ RAG 工具两形态（MCP 客户端 / 进程内直连 + fallback）
-│   ├── toolkit.py             # 工具集组装（auto/mcp/direct）
+│   ├── memory.py              # ★ 跨任务长期记忆：JSONL + 字面召回 + 注入 + 两个工具
+│   ├── eval_harness.py        # ★ 量化评测：完成率/工具选择/失败恢复/领域外诚实率
+│   ├── toolkit.py             # 工具集组装（auto/mcp/direct + memory）
 │   ├── trace.py               # ★ JSONL trace + 控制台摘要
 │   └── runner.py              # 任务装配、收尾、指标聚合
-├── scripts/demo_tasks.py      # 三条固定 demo（证据生成器）
-├── tests/                     # 41 个测试（默认 40 passed / 1 skipped；MCP 端到端需设环境变量）
+├── scripts/
+│   ├── demo_tasks.py          # 三条固定 demo（证据生成器）
+│   ├── demo_memory.py         # 跨任务记忆离线演示（不需要 API key）
+│   └── eval_agent.py          # 批量评测 CLI（落 eval_results/*.json + *.md）
+├── data/
+│   └── eval_queries.json      # 16 条评测 query（含分类与期望工具）
+├── tests/                     # 53 passed / 1 skipped（+9：记忆 7 + 并发 2；MCP 端到端需设环境变量）
 ├── traces/                    # 真实运行 trace（JSONL，可回放）
 └── docs/
     └── 讲解指南.md            # ★ 零基础讲解 + 面试问答模板（含「面试怎么讲」）
@@ -470,15 +567,18 @@ hello-agent/
 ## 11. 已知局限与下一步（不吹）
 
 **局限（如实说）**
-- 单任务会话，**没有跨任务记忆**；没有多 Agent / 任务规划；
-- 工具**串行执行**（本轮多个工具调用逐个跑），只有只读工具（因此不涉及副作用补偿）；
-- 没有自动的质量评测集（「工具选择正确率 / 失败恢复率」目前只有单次运行的指标可看）；
+- 跨任务记忆的召回是**字面重叠**（英文词 + 中文单字/二元组），不是语义召回；
+  单机 JSONL 存储，未做多进程并发写锁与冲突合并；没有多 Agent / 任务规划；
+- 工具并发只针对同一轮内**互不依赖**的调用；有副作用的工具需要额外的串行约束
+  （本项目工具均为只读或本地记忆写入，未做副作用补偿）；
+- 评测集 16 条，规模小，指标只用于回归参考，不代表线上分布；
 - 每任务新建 MCP 会话，子进程启动 + 预热约 5s 未优化。
 
 **下一步（按优先级）**
-1. 造 15–20 条 query 的评测集：统计工具选择正确率 / 参数正确率 / 平均步数 / 失败恢复率（`metrics` 字段已经是现成数据源）；
-2. 工具调用并发化（`asyncio.gather` + 只对有副作用的工具加串行约束）；
-3. 记忆与上下文压缩（方向见 `docs/讲解指南.md` 的追问答案，不吹已实现）。
+1. 记忆召回升级为语义/混合检索（复用 rag-eval-platform 的 BM25 + 向量 + RRF），并加 TTL / 去重；
+2. 上下文压缩：长任务的消息摘要，避免 `messages` 无限增长；
+3. MCP 会话复用 / 常驻进程，消除每任务 5s 的启动成本；
+4. 评测集扩到 50+ 条，按类别看指标（工具选择 / 失败恢复 / 领域外诚实），而不只看总体。
 
 ---
 

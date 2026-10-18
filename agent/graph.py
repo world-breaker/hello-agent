@@ -13,6 +13,7 @@
                  └──(无 tool_calls / 超步数 / 模型故障)→ END
 """
 
+import asyncio
 import time
 from typing import Annotated, Any, Dict, List, TypedDict
 
@@ -59,10 +60,19 @@ def build_agent_graph(
     executor: ToolExecutor,
     tracer: Tracer,
     config: Dict[str, Any],
+    memory_context: str = "",
 ):
-    """构建并编译 ReAct 图。"""
+    """构建并编译 ReAct 图。
+
+    memory_context：跨任务记忆（由 runner 从 MemoryStore 召回），非空时追加到 system prompt。
+    """
     max_steps = int(config["agent"]["max_steps"])
     system_prompt = str(config["agent"]["system_prompt"])
+    if memory_context:
+        system_prompt = system_prompt + "\n\n" + memory_context
+
+    parallel_tools = bool(config["agent"].get("parallel_tools", True))
+    max_parallel_tools = max(1, int(config["agent"].get("max_parallel_tools", 4)))
 
     # ★ 关键一步：把工具 schema 绑定到模型。
     # 框架版（create_react_agent / create_agent）会自动做这件事，手写循环必须显式绑定，
@@ -123,17 +133,51 @@ def build_agent_graph(
     # ---------- 节点 2：执行工具 ----------
     async def tools_node(state: AgentState) -> Dict[str, Any]:
         last = state["messages"][-1]
-        tool_messages: List[ToolMessage] = []
-        # 同一轮的多个工具调用按顺序执行：便于 trace 归因；工具集小，串行的额外成本可忽略
-        for call in getattr(last, "tool_calls", None) or []:
-            outcome = await executor.execute(call["name"], call.get("args") or {})
-            tool_messages.append(
-                ToolMessage(
-                    content=outcome.to_observation(),
-                    tool_call_id=call.get("id") or "",
-                    name=call.get("name") or "unknown",
-                )
+        calls = list(getattr(last, "tool_calls", None) or [])
+        if not calls:
+            return {"messages": [], "status": "in_progress"}
+
+        started = time.perf_counter()
+
+        # ★ 并发化：模型一轮可能同时给出多个互不依赖的 tool_calls（如同时查时间 + 算数）。
+        #   串行执行会把延迟累加；并发执行的总延迟约等于最慢的那个工具。
+        #   用 Semaphore 限制并发上限，避免模型一次吐出几十个调用把依赖打爆。
+        if parallel_tools and len(calls) > 1:
+            tracer.event(
+                "parallel_tools",
+                count=len(calls),
+                max_parallel=max_parallel_tools,
+                tools=[call.get("name") for call in calls],
             )
+            semaphore = asyncio.Semaphore(max_parallel_tools)
+
+            async def _run(call: Dict[str, Any]):
+                async with semaphore:
+                    return await executor.execute(call["name"], call.get("args") or {})
+
+            # gather 保持输入顺序 → ToolMessage 与 tool_calls 一一对应（协议要求）
+            outcomes = await asyncio.gather(*(_run(call) for call in calls))
+            tracer.event(
+                "parallel_tools_done",
+                count=len(calls),
+                elapsed_ms=round((time.perf_counter() - started) * 1000, 2),
+            )
+        else:
+            # 单个调用或显式关闭并发时走串行路径（保留原行为）
+            outcomes = []
+            for call in calls:
+                outcomes.append(
+                    await executor.execute(call["name"], call.get("args") or {})
+                )
+
+        tool_messages: List[ToolMessage] = [
+            ToolMessage(
+                content=outcome.to_observation(),
+                tool_call_id=call.get("id") or "",
+                name=call.get("name") or "unknown",
+            )
+            for call, outcome in zip(calls, outcomes)
+        ]
         return {"messages": tool_messages, "status": "in_progress"}
 
     # ---------- 路由：决定继续调工具还是收尾 ----------

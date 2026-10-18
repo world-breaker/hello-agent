@@ -11,3 +11,8 @@ venv/
 # 日志/缓存
 *.log
 logs/
+
+# 运行产物：跨任务记忆 / 评测结果（可再生成，不入库）
+data/agent_memory.jsonl
+data/demo_memory.jsonl
+eval_results/

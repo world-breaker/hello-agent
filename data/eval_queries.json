@@ -1,0 +1,98 @@
+[
+  {
+    "id": "q01",
+    "category": "multi_tool",
+    "task": "先查知识库：LoRA 的典型配置里 r 和 α（alpha）分别是多少？然后用计算器算一下 α/r 的值，最后告诉我现在的时间（精确到秒）。",
+    "expect_tools": ["search_knowledge", "calculator", "current_time"]
+  },
+  {
+    "id": "q02",
+    "category": "retrieval_arithmetic",
+    "task": "知识库里说 chunk_size 的典型取值范围是多少？如果我按这个范围的上限，对一篇 5000 字符的文档做固定窗口切分、overlap 取 50，大约会产生多少个 chunk？请给出计算过程。",
+    "expect_tools": ["search_knowledge", "calculator"]
+  },
+  {
+    "id": "q03",
+    "category": "out_of_domain",
+    "task": "知识库里有没有关于「武汉天气」的内容？如果没有，请直接说没有，不要编造。",
+    "expect_tools": ["search_knowledge"]
+  },
+  {
+    "id": "q04",
+    "category": "retrieval_only",
+    "task": "用知识库里的内容解释一下 RAG 系统是怎么做检索优化的。",
+    "expect_tools": ["search_knowledge"]
+  },
+  {
+    "id": "q05",
+    "category": "time_only",
+    "task": "现在几点了？请告诉我精确的日期和时间。",
+    "expect_tools": ["current_time"]
+  },
+  {
+    "id": "q06",
+    "category": "calculator_only",
+    "task": "帮我算一下 (1024 - 50) / (1024 - 50) 等于多少。",
+    "expect_tools": ["calculator"]
+  },
+  {
+    "id": "q07",
+    "category": "multi_tool",
+    "task": "查一下知识库里 Transformer 的自注意力机制是怎么计算的，再算一下 2 的 10 次方，最后报一下当前时间。",
+    "expect_tools": ["search_knowledge", "calculator", "current_time"]
+  },
+  {
+    "id": "q08",
+    "category": "retrieval_arithmetic",
+    "task": "知识库提到模型量化常见方法，请查出来，并算一下如果一段 2048 字符文本按 chunk_size=512、overlap=50 切分会有几个 chunk。",
+    "expect_tools": ["search_knowledge", "calculator"]
+  },
+  {
+    "id": "q09",
+    "category": "out_of_domain",
+    "task": "知识库里讲没讲怎么做番茄炒蛋？如果没讲，请如实说没有，不要编。",
+    "expect_tools": ["search_knowledge"]
+  },
+  {
+    "id": "q10",
+    "category": "retrieval_only",
+    "task": "基于知识库说明一下 LoRA 微调的原理和典型参数。",
+    "expect_tools": ["search_knowledge"]
+  },
+  {
+    "id": "q11",
+    "category": "multi_tool",
+    "task": "先检索知识库里关于 RAG 系统核心组件的内容，然后用计算器算 (5000-512)/(512-50)+1，最后告诉我现在的时间。",
+    "expect_tools": ["search_knowledge", "calculator", "current_time"]
+  },
+  {
+    "id": "q12",
+    "category": "retrieval_arithmetic",
+    "task": "查知识库：embedding 模型用的是哪个？它的向量维度是多少？再算一下 512 的一半是多少。",
+    "expect_tools": ["search_knowledge", "calculator"]
+  },
+  {
+    "id": "q13",
+    "category": "time_only",
+    "task": "请告诉我今天是星期几、现在几点。",
+    "expect_tools": ["current_time"]
+  },
+  {
+    "id": "q14",
+    "category": "calculator_only",
+    "task": "计算 16 除以 8 的结果。",
+    "expect_tools": ["calculator"]
+  },
+  {
+    "id": "q15",
+    "category": "out_of_domain",
+    "task": "知识库里有 NBA 总决赛的比分吗？没有就直接说没有。",
+    "expect_tools": ["search_knowledge"]
+  },
+  {
+    "id": "q16",
+    "category": "retrieval_only",
+    "task": "用知识库内容讲讲大语言模型的微调技术主要有哪些。",
+    "expect_tools": ["search_knowledge"]
+  }
+]

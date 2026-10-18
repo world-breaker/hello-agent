@@ -11,6 +11,7 @@ from langchain_core.messages import AIMessage, AnyMessage, HumanMessage
 from agent.config import describe_llm, get_llm_settings, load_config
 from agent.graph import build_agent_graph
 from agent.llm import build_llm
+from agent.memory import build_memory_context
 from agent.resilience import ToolExecutor
 from agent.toolkit import build_toolset
 from agent.trace import Tracer
@@ -125,9 +126,29 @@ async def run_task(
     try:
         async with build_toolset(config, tracer, rag_mode) as toolset:
             rag_mode_used = toolset.rag_mode
+
+            # 跨任务记忆：只注入与本次任务关键词相关的 top-k 条，避免污染上下文
+            memory_cfg = config.get("memory", {}) or {}
+            memory_context, memory_keys = build_memory_context(
+                toolset.memory,
+                task,
+                top_k=int(memory_cfg.get("inject_top_k", 3)),
+                max_chars=int(memory_cfg.get("max_inject_chars", 800)),
+            )
+            if toolset.memory is not None:
+                tracer.event(
+                    "memory_injected",
+                    count=len(memory_keys),
+                    keys=memory_keys,
+                    chars=len(memory_context),
+                    total_records=len(toolset.memory),
+                )
+
             executor = ToolExecutor(toolset.tools, config, tracer, toolset.fallbacks)
             llm = build_llm(settings)
-            graph = build_agent_graph(llm, executor, tracer, config)
+            graph = build_agent_graph(
+                llm, executor, tracer, config, memory_context=memory_context
+            )
 
             state = await graph.ainvoke(
                 {

@@ -24,6 +24,9 @@ DEFAULTS: Dict[str, Any] = {
     "agent": {
         "max_steps": 6,
         "recursion_limit": 25,
+        # 同一轮模型返回多个 tool_calls 时是否并发执行（Semaphore 限流）
+        "parallel_tools": True,
+        "max_parallel_tools": 4,
         "system_prompt": (
             "你是一个严谨的助手，可以调用工具。规则：\n"
             "1) 需要事实依据时先检索知识库（search_knowledge），基于返回片段回答，不要凭记忆编造；\n"
@@ -67,6 +70,16 @@ DEFAULTS: Dict[str, Any] = {
                 "config_path": "config.yaml",
             },
         },
+    },
+    # 跨任务长期记忆（JSONL 落盘；任务启动时按关键词召回并注入 system prompt）
+    "memory": {
+        "enabled": True,
+        "path": "./data/agent_memory.jsonl",
+        "tools": True,            # 是否注册 remember_fact / recall_memory 工具
+        "inject_top_k": 3,        # 任务启动时自动注入的相关记忆条数
+        "max_inject_chars": 800,  # 注入文本长度上限（控制上下文成本）
+        "max_content_chars": 2000,
+        "max_records": 2000,      # 超过后自动 compaction（同 key 只留最新）
     },
     "trace": {
         "dir": "./traces",
@@ -125,6 +138,12 @@ def load_config(path: str | Path | None = None) -> Dict[str, Any]:
     if not trace_dir.is_absolute():
         trace_dir = config_path.parent / trace_dir
     config["trace"]["dir"] = str(trace_dir.resolve())
+
+    # 长期记忆文件同样按配置文件所在目录解析
+    memory_path = Path(str(config["memory"]["path"]))
+    if not memory_path.is_absolute():
+        memory_path = config_path.parent / memory_path
+    config["memory"]["path"] = str(memory_path.resolve())
 
     # RAG 相关相对路径同样解析成绝对路径
     rag_cfg = config["tools"]["rag"]

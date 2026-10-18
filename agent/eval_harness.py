@@ -1,0 +1,165 @@
+"""hello-agent 量化评测模块（对应 README「下一步」：把单次运行指标聚合成作品集级评估）。
+
+设计原则：
+- **只新增文件，不改动既有编排 / 执行代码**；
+- **评测逻辑与模型解耦**：`evaluate(records)` 是纯函数，离线可单测；
+  真正调模型的 `run_eval` 在 `scripts/eval_agent.py` 里（不在本模块，避免导入期拉起 LLM 依赖）。
+- 工具名从 trace 的 JSONL 里抽（thought 的 tool_calls + observation 的 tool 字段），
+  不依赖运行时的内存状态，复盘时可直接对 trace 文件重算。
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# 领域外问题（知识库里没有）的「诚实否认」关键词：命中即视为没有编造
+_HONESTY_MARKERS = ("没有", "查不到", "无法回答", "不知道", "没找到", "不涉及", "没有相关内容", "未找到")
+
+
+@dataclass
+class EvalRecord:
+    """单条 query 的评测记录（由 run_eval 填充，也可在测试里手工构造）。"""
+
+    query: Dict[str, Any]
+    status: str
+    steps: int
+    tool_calls: int
+    tool_ok: int
+    tool_failed: int
+    tool_retries: int
+    tool_degraded: int
+    circuit_opens: int
+    tool_success_rate: float | None
+    used_tools: List[str] = field(default_factory=list)
+    final_answer: str = ""
+
+
+def load_eval_set(path: str | Path) -> List[Dict[str, Any]]:
+    """加载评测集（JSON 数组，或 {"queries": [...]} 两种形态都支持）。"""
+    path = Path(path)
+    with path.open(encoding="utf-8") as f:
+        data = json.load(f)
+    if isinstance(data, dict):
+        return data.get("queries", [])
+    return data
+
+
+def extract_tool_names(trace_path: str | Path) -> List[str]:
+    """从一次运行的 JSONL trace 里抽出被调用的工具名（去重、保序）。
+
+    来源：thought 事件的 tool_calls（模型发起）与 observation 事件的 tool 字段（实际执行）。
+    任一事件类型缺字段都不影响另一路。
+    """
+    trace_path = Path(trace_path)
+    if not trace_path.exists():
+        return []
+    names: List[str] = []
+    seen = set()
+    with trace_path.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            # 路由一：任何事件里都可能带 tool_calls 列表
+            for call in ev.get("tool_calls") or []:
+                n = call.get("name") if isinstance(call, dict) else None
+                if isinstance(n, str) and n not in seen:
+                    names.append(n)
+                    seen.add(n)
+            # 路由二：observation 事件直接带 tool 字段
+            t = ev.get("tool")
+            if isinstance(t, str) and t not in seen:
+                names.append(t)
+                seen.add(t)
+    return names
+
+
+def evaluate(records: List[EvalRecord]) -> Dict[str, Any]:
+    """纯函数：把若干条 EvalRecord 聚合成作品集级指标。离线可单测。"""
+    n = len(records)
+    if n == 0:
+        return {"n": 0}
+
+    completed = [r for r in records if r.status == "completed"]
+
+    # 工具选择准确率：标注了 expect_tools 的条目里，期望工具集合 ⊆ 实际使用集合即算对
+    labeled = [r for r in records if r.query.get("expect_tools")]
+    sel_ok = [
+        r for r in labeled
+        if set(r.query["expect_tools"]) <= set(r.used_tools)
+    ]
+
+    # 失败恢复率：发生过重试/降级且最终 completed 的占比
+    had_failure = [r for r in records if (r.tool_retries + r.tool_degraded) > 0]
+    recovered = [r for r in had_failure if r.status == "completed"]
+
+    # 领域外诚实率：category=out_of_domain 的回答里出现否认词
+    ood = [r for r in records if r.query.get("category") == "out_of_domain"]
+    honest = [r for r in ood if any(k in r.final_answer for k in _HONESTY_MARKERS)]
+
+    # 分类别完成率
+    by_cat: Dict[str, Dict[str, int]] = {}
+    for r in records:
+        cat = r.query.get("category", "uncategorized")
+        d = by_cat.setdefault(cat, {"total": 0, "completed": 0})
+        d["total"] += 1
+        if r.status == "completed":
+            d["completed"] += 1
+
+    sr_vals = [r.tool_success_rate for r in records if r.tool_success_rate is not None]
+    avg_steps = sum(r.steps for r in records) / n
+
+    def _rate(num: int, den: int) -> float | None:
+        return round(num / den, 4) if den else None
+
+    return {
+        "n": n,
+        "completion_rate": _rate(len(completed), n),
+        "avg_steps": round(avg_steps, 2),
+        "avg_tool_success_rate": _rate(sum(sr_vals), len(sr_vals)) if sr_vals else None,
+        "tool_selection_accuracy": _rate(len(sel_ok), len(labeled)),
+        "failure_recovery_rate": _rate(len(recovered), len(had_failure)),
+        "out_of_domain_honesty_rate": _rate(len(honest), len(ood)),
+        "by_category": {
+            cat: {"total": d["total"], "completed": d["completed"], "rate": _rate(d["completed"], d["total"])}
+            for cat, d in by_cat.items()
+        },
+    }
+
+
+def render_markdown(summary: Dict[str, Any], records: List[EvalRecord]) -> str:
+    """把评测结果渲染成可贴进 README / 面试材料的 Markdown。"""
+    lines = ["# hello-agent 量化评测报告", ""]
+    if summary.get("n"):
+        lines.append(f"- 评测条数：**{summary['n']}**")
+        lines.append(f"- 完成率（status=completed）：**{summary['completion_rate']}**")
+        lines.append(f"- 平均步数：**{summary['avg_steps']}**")
+        lines.append(f"- 平均工具成功率：**{summary['avg_tool_success_rate']}**")
+        lines.append(f"- 工具选择准确率（期望工具 ⊆ 实际使用）：**{summary['tool_selection_accuracy']}**")
+        lines.append(f"- 失败恢复率（重试/降级后仍完成）：**{summary['failure_recovery_rate']}**")
+        lines.append(f"- 领域外诚实率（不编造）：**{summary['out_of_domain_honesty_rate']}**")
+        lines.append("")
+        lines.append("## 分类别完成率")
+        for cat, d in summary.get("by_category", {}).items():
+            lines.append(f"- {cat}：{d['completed']}/{d['total']}（{d['rate']}）")
+    lines.append("")
+    lines.append("## 逐条明细")
+    lines.append("")
+    lines.append("| # | category | status | steps | tools | success_rate |")
+    lines.append("|---|---|---|---|---|---|")
+    for i, r in enumerate(records, 1):
+        tools = ",".join(r.used_tools) or "—"
+        lines.append(
+            f"| {i} | {r.query.get('category', '')} | {r.status} | {r.steps} | {tools} | {r.tool_success_rate} |"
+        )
+    return "\n".join(lines)

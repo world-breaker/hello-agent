@@ -27,6 +27,9 @@ DEFAULTS: Dict[str, Any] = {
         # 同一轮模型返回多个 tool_calls 时是否并发执行（Semaphore 限流）
         "parallel_tools": True,
         "max_parallel_tools": 4,
+        # 送模型前的上下文预算（字符数，粗略 token 代理）；最近 N 条原样保留
+        "max_context_chars": 12000,
+        "context_keep_last": 6,
         "system_prompt": (
             "你是一个严谨的助手，可以调用工具。规则：\n"
             "1) 需要事实依据时先检索知识库（search_knowledge），基于返回片段回答，不要凭记忆编造；\n"
@@ -76,6 +79,9 @@ DEFAULTS: Dict[str, Any] = {
         "enabled": True,
         "path": "./data/agent_memory.jsonl",
         "tools": True,            # 是否注册 remember_fact / recall_memory 工具
+        "recall_mode": "bm25",    # bm25（默认）| overlap（旧的字面重叠比例，便于 A/B）
+        "bm25_k1": 1.5,
+        "bm25_b": 0.75,
         "inject_top_k": 3,        # 任务启动时自动注入的相关记忆条数
         "max_inject_chars": 800,  # 注入文本长度上限（控制上下文成本）
         "max_content_chars": 2000,

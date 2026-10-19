@@ -123,3 +123,84 @@ def test_disabled_memory_does_nothing(tmp_path):
     store = MemoryStore(config)
     assert len(store) == 0
     assert build_memory_context(store, "任何问题") == ("", [])
+
+
+def test_bm25_recall_on_labeled_set(tmp_path):
+    """6 条记忆 / 6 个查询：BM25 Recall@1 应为 6/6。"""
+    store = MemoryStore(make_config(tmp_path))
+    memories = [
+        ("lang", "用户的默认语言是中文"),
+        ("project", "项目路径是 D:/programmer/LLM"),
+        ("db", "数据库使用 PostgreSQL 16"),
+        ("deploy", "服务部署在 Docker 容器里"),
+        ("tz", "用户所在时区是 Asia/Shanghai"),
+        ("editor", "常用编辑器是 VSCode"),
+    ]
+    for key, content in memories:
+        store.remember(content, key=key)
+
+    cases = [
+        ("我的默认语言是什么", "lang"),
+        ("项目路径在哪", "project"),
+        ("用的什么数据库", "db"),
+        ("服务怎么部署的", "deploy"),
+        ("我的时区是什么", "tz"),
+        ("常用编辑器是哪个", "editor"),
+    ]
+    hits = 0
+    for query, expected in cases:
+        results = store.recall(query, top_k=1)
+        assert results, f"没有召回任何记忆：{query}"
+        if results[0]["key"] == expected:
+            hits += 1
+    assert hits == len(cases), f"BM25 Recall@1 = {hits}/{len(cases)}"
+
+
+def test_overlap_mode_still_available(tmp_path):
+    """保留旧的 overlap 模式，便于做 A/B 对照。"""
+    config = make_config(tmp_path, recall_mode="overlap")
+    store = MemoryStore(config)
+    store.remember("用户的默认语言是中文", key="lang")
+    store.remember("项目路径是 D:/programmer/LLM", key="project")
+
+    hits = store.recall("默认语言", top_k=1)
+    assert hits[0]["key"] == "lang"
+
+
+def test_bm25_score_is_positive(tmp_path):
+    store = MemoryStore(make_config(tmp_path))
+    store.remember("数据库使用 PostgreSQL 16", key="db")
+    hits = store.recall("数据库", top_k=1)
+    assert hits[0]["score"] > 0
+
+
+def test_bm25_beats_overlap_on_long_distractor(tmp_path):
+    """长度归一化场景：两条记忆命中同一组关键词，只差文档长度。
+
+    - target 很短：「数据库 配置」；
+    - distractor 在一大段无关内容里也提到「数据库 配置」；
+    - overlap 只看命中词比例 → 两者打平，按写入顺序选中 distractor；
+    - BM25 有文档长度归一化（b=0.75）→ 短而聚焦的 target 分数更高。
+
+    这是「为什么要把字面重叠升级成 BM25」的可复现证据。
+    """
+    target = ("target", "数据库 配置")
+    distractor = ("distractor", "数据库 配置 " + "无关内容" * 60)
+    query = "数据库 配置"
+
+    store_bm25 = MemoryStore(make_config(tmp_path / "bm25"))
+    store_overlap = MemoryStore(
+        make_config(tmp_path / "overlap", recall_mode="overlap")
+    )
+    # 先写 distractor：overlap 打平时按写入顺序取第一个
+    for store in (store_bm25, store_overlap):
+        store.remember(distractor[1], key=distractor[0])
+        store.remember(target[1], key=target[0])
+
+    bm25_top = store_bm25.recall(query, top_k=1)[0]
+    overlap_top = store_overlap.recall(query, top_k=1)[0]
+
+    assert bm25_top["key"] == "target", f"BM25 未选中短而精确的记忆：{bm25_top}"
+    assert overlap_top["key"] == "distractor", (
+        f"overlap 未被长文档带偏（本用例失去对照意义）：{overlap_top}"
+    )

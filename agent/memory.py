@@ -8,8 +8,10 @@
 设计取舍（面试可讲）：
 - **JSONL 追加写**：一行一条记录，崩溃最多丢最后一行；便于 grep / jq / 人工排查；
 - **同 key 后写覆盖**：`remember` 允许带 key，读取时以最后一条为准（天然 upsert，不引入数据库）；
-- **召回用字面重叠**（英文词 + 中文单字/二元组）而不是向量：记忆条数通常几十~几百，
-  零依赖、可解释、离线可跑；要语义召回时再接 embedding（与 rag-eval 的混合检索同思路）；
+- **召回用 BM25**（英文词 + 中文单字/二元组分词）：记忆条数通常几十~几百，
+  零依赖、可解释、离线可跑；BM25 的 idf 让稀有词（项目名/术语）权重更高，
+  比简单词重叠更符合「用户提到独特术语时应命中那条记忆」的直觉；
+  要语义召回时再接 embedding（与 rag-eval 的混合检索同思路）；
 - **只注入命中的记忆**：没有关键词重叠就不注入，避免把无关记忆塞进 prompt 污染上下文；
 - **显式工具 + 自动注入**：模型可用 `remember_fact` 主动记，任务开始时系统自动召回 top-k。
 
@@ -18,6 +20,7 @@
 """
 
 import json
+import math
 import re
 import threading
 import uuid
@@ -43,6 +46,43 @@ def _tokens(text: str) -> List[str]:
     tokens.extend(cjk)
     tokens.extend(cjk[i] + cjk[i + 1] for i in range(len(cjk) - 1))
     return tokens
+
+
+def _bm25_scores(
+    query_tokens: List[str],
+    docs_tokens: List[List[str]],
+    k1: float = 1.5,
+    b: float = 0.75,
+) -> List[float]:
+    """Okapi BM25（纯 Python，零依赖）。
+
+    为什么记忆召回要用 BM25 而不是简单的词重叠比例：
+    重叠比例把「量化」和「NF4」当成同等重要；BM25 的 idf 会给稀有词更高权重，
+    更符合「用户提到一个独特的项目名/术语时，应该命中那条记忆」的直觉。
+    """
+    n = len(docs_tokens)
+    if n == 0 or not query_tokens:
+        return []
+
+    avgdl = sum(len(tokens) for tokens in docs_tokens) / n
+    df: Dict[str, int] = {}
+    for tokens in docs_tokens:
+        for token in set(tokens):
+            df[token] = df.get(token, 0) + 1
+
+    scores: List[float] = []
+    for tokens in docs_tokens:
+        dl = len(tokens)
+        score = 0.0
+        for token in set(query_tokens):
+            freq = tokens.count(token)
+            if freq == 0:
+                continue
+            idf = math.log((n - df.get(token, 0) + 0.5) / (df.get(token, 0) + 0.5) + 1.0)
+            denom = freq + k1 * (1 - b + b * dl / (avgdl or 1.0))
+            score += idf * (freq * (k1 + 1)) / denom
+        scores.append(score)
+    return scores
 
 
 def _now_iso() -> str:
@@ -78,10 +118,10 @@ class MemoryRecord:
 
 
 class MemoryStore:
-    """长期记忆存储：JSONL 落盘 + 同 key 覆盖 + 字面召回。
+    """长期记忆存储：JSONL 落盘 + 同 key 覆盖 + BM25 召回（可切回字面重叠）。
 
     - `remember()` 追加一条记录；
-    - `recall()` 按关键词重叠打分返回 top-k；
+    - `recall()` 按 BM25（默认）或字面重叠打分返回 top-k；
     - `all()` 返回按时间排序的当前视图（同 key 只保留最后一条）。
     """
 
@@ -92,6 +132,10 @@ class MemoryStore:
         self.path = Path(raw_path)
         self.max_records = int(mem_cfg.get("max_records", 2000))
         self.max_content_chars = int(mem_cfg.get("max_content_chars", 2000))
+        # 召回算法：bm25（默认，稀有词权重更高）| overlap（旧的字面重叠比例，便于 A/B）
+        self.recall_mode = str(mem_cfg.get("recall_mode", "bm25")).lower()
+        self.bm25_k1 = float(mem_cfg.get("bm25_k1", 1.5))
+        self.bm25_b = float(mem_cfg.get("bm25_b", 0.75))
         self.run_id = ""
 
         self._lock = threading.Lock()
@@ -179,29 +223,46 @@ class MemoryStore:
             return len(self._records)
 
     def recall(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
-        """按查询与记忆的字面重叠召回；没有重叠就不返回（宁缺毋滥）。"""
-        query_tokens = set(_tokens(query))
+        """按 BM25（默认）或字面重叠召回；没有命中就不返回（宁缺毋滥）。
+
+        - BM25：稀有词（项目名 / 专有术语）权重更高；
+        - overlap：旧的字面重叠比例，保留用于 A/B 对照。
+        两种模式都在 key 精确出现时给一点额外加权。
+        """
+        query_tokens = list(dict.fromkeys(_tokens(query)))  # 去重且保持顺序
         if not query_tokens:
             return []
 
-        scored: List[Tuple[float, MemoryRecord]] = []
         with self._lock:
             records = list(self._records.values())
+        if not records:
+            return []
 
+        docs_tokens: List[List[str]] = []
         for record in records:
-            record_tokens = set(_tokens(record.content)) | set(_tokens(record.key))
+            tokens = _tokens(record.content) + _tokens(record.key)
             for tag in record.tags:
-                record_tokens |= set(_tokens(tag))
-            if not record_tokens:
+                tokens += _tokens(tag)
+            docs_tokens.append(tokens)
+
+        if self.recall_mode == "overlap":
+            query_set = set(query_tokens)
+            raw_scores = [
+                len(query_set & set(tokens)) / len(query_set) for tokens in docs_tokens
+            ]
+        else:
+            raw_scores = _bm25_scores(
+                query_tokens, docs_tokens, k1=self.bm25_k1, b=self.bm25_b
+            )
+
+        scored: List[Tuple[float, MemoryRecord]] = []
+        query_lower = (query or "").lower()
+        for record, score in zip(records, raw_scores):
+            if score <= 0:
                 continue
-            overlap = query_tokens & record_tokens
-            if not overlap:
-                continue
-            # 覆盖率：命中查询词的比例；再给 key/tag 精确命中一点加权
-            score = len(overlap) / len(query_tokens)
-            if record.key.lower() in (query or "").lower():
-                score += 0.5
-            scored.append((score, record))
+            if record.key.lower() in query_lower:
+                score += 0.5  # key 精确命中：在 BM25 之外再加一点确定性权重
+            scored.append((float(score), record))
 
         scored.sort(key=lambda item: (item[0], item[1].created_at), reverse=True)
         results = []

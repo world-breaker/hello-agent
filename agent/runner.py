@@ -53,6 +53,17 @@ def _summarize_metrics(tracer: Tracer, executor: ToolExecutor) -> Dict[str, Any]
     for event in tracer.events:
         counts[event["type"]] = counts.get(event["type"], 0) + 1
     tool_calls = executor.stats["calls"]
+
+    # 上下文压缩：记录压缩次数、最大节省字符数、最近一次的 before/after
+    context_events = [event for event in tracer.events if event["type"] == "context_compressed"]
+    context_saved = max(
+        (
+            int(event.get("before_chars", 0)) - int(event.get("after_chars", 0))
+            for event in context_events
+        ),
+        default=0,
+    )
+
     return {
         "llm_calls": counts.get("thought", 0),
         "tool_calls": tool_calls,
@@ -62,6 +73,10 @@ def _summarize_metrics(tracer: Tracer, executor: ToolExecutor) -> Dict[str, Any]
         "tool_degraded": executor.stats["degraded"],
         "circuit_opens": executor.stats["circuit_opens"],
         "tool_success_rate": round(executor.stats["ok"] / tool_calls, 4) if tool_calls else None,
+        "context_compressions": len(context_events),
+        "context_saved_chars": context_saved,
+        "context_last_before_chars": context_events[-1].get("before_chars") if context_events else None,
+        "context_last_after_chars": context_events[-1].get("after_chars") if context_events else None,
         "event_counts": counts,
     }
 
@@ -204,7 +219,8 @@ async def run_task(
     print(
         f"===== 指标：步数={state.get('steps', 0)} 工具调用={metrics.get('tool_calls')} "
         f"失败={metrics.get('tool_failed')} 重试={metrics.get('tool_retries')} "
-        f"降级={metrics.get('tool_degraded')} RAG形态={rag_mode_used} ====="
+        f"降级={metrics.get('tool_degraded')} 上下文压缩={metrics.get('context_saved_chars')}字符 "
+        f"RAG形态={rag_mode_used} ====="
     )
     print(f"===== trace：{tracer.path} =====")
 

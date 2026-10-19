@@ -12,7 +12,7 @@
 
 | 项目 | 事实 | 证据位置 |
 |---|---|---|
-| 离线测试 | `41 passed`（40 个纯离线 + 1 个 MCP 端到端，后者用环境变量开启） | §7 |
+| 离线测试 | `60 passed / 1 skipped`（MCP 端到端测试用环境变量开启） | §7 |
 | 真实任务 | 三条 demo 全部 `status=completed`（步数 3 / 4 / 2，总耗时 30.97s） | §1 |
 | 最大步数 | `--max-steps 1` 稳定得到「未完成收尾」，不会假完成 | §1.3 |
 | 降级 | 把 MCP 命令改坏后，`auto` 模式如实降级到进程内直连并完成任务 | §1.4 |
@@ -219,7 +219,7 @@ flowchart TB
 | `calculator` | `expression` | JSON：`{ok, result}` 或 `{ok:false, error, hint}` | AST 白名单：数字、`+ - * / // % **`、`sqrt/log/exp/abs/round/min/max/pow/sin/cos/tan`；**无 `eval`**、禁止属性访问/导入/下标/字符串运算 |
 | `current_time` | — | JSON：`date/time/weekday/human` | 时区在构造时固定为 `Asia/Shanghai`，**模型无法传入任意时区字符串** |
 | `remember_fact` | `content`, `key=""`, `tags=""` | JSON：`{ok, key, total}` | **跨任务长期记忆**：写入 JSONL；同 key 覆盖；拒绝疑似密钥 |
-| `recall_memory` | `query`, `top_k=5` | JSON：`{ok, count, results[{key, content, tags, score}]}` | 按字面重叠召回历史记忆；没命中就返回空（不编造） |
+| `recall_memory` | `query`, `top_k=5` | JSON：`{ok, count, results[{key, content, tags, score}]}` | 按 BM25 召回历史记忆；没命中就返回空（不编造） |
 
 这些工具都在贯彻同一件事：**把模型当作不可信输入源**——参数只走受控通道，错误变成可读反馈而不是崩溃。
 （`remember_fact` / `recall_memory` 由 `memory.tools: true` 控制是否注册，见 §5.5。）
@@ -376,7 +376,7 @@ agent:
 ```
 任务开始
   └─ MemoryStore 从 JSONL 加载（同 key 以最后一条为准）
-  └─ recall(task) 按字面重叠召回 top-k
+  └─ recall(task) 按 BM25 召回 top-k（稀有词权重更高）
   └─ build_memory_context() 拼成一段文本 → 追加到 system prompt
 任务进行中
   └─ 模型可调用 remember_fact(content, key?, tags?) 主动写
@@ -391,7 +391,7 @@ agent:
 |---|---|
 | **JSONL 追加写** | 一行一条，崩溃最多丢最后一行；便于 `grep` / `jq` / 人工排查 |
 | **同 key 后写覆盖** | 不引入数据库就获得 upsert 语义；读取时只保留最新视图 |
-| **字面召回（英文词 + 中文单字/二元组）** | 记忆通常几十~几百条，零依赖、可解释、离线可跑；语义召回可再接 embedding（与 rag-eval 混合检索同思路） |
+| **BM25 召回（英文词 + 中文单字/二元组）** | 比「词重叠比例」更合理：idf 让稀有词（项目名/术语）权重更高，`b` 做文档长度归一化；零依赖、可解释、离线可跑。`recall_mode: "overlap"` 可切回旧算法做 A/B |
 | **只注入命中的 top-k** | 与任务无关键词重叠就不注入，避免把无关记忆塞进 prompt |
 | **拒绝疑似密钥** | 记忆是长期落盘的，`sk-` / `API_KEY=` 直接拒绝，避免把密钥写进磁盘 |
 
@@ -402,11 +402,26 @@ memory:
   enabled: true
   path: "./data/agent_memory.jsonl"
   tools: true                 # 注册 remember_fact / recall_memory
+  recall_mode: "bm25"         # bm25（默认）| overlap（旧算法，便于 A/B）
+  bm25_k1: 1.5
+  bm25_b: 0.75
   inject_top_k: 3             # 任务启动自动注入的条数
   max_inject_chars: 800       # 注入长度上限（控上下文成本）
   max_content_chars: 2000
   max_records: 2000           # 超过后自动 compact（同 key 只留最新）
 ```
+
+**为什么从「词重叠」升级到 BM25（有对照数据）**：
+构造两条命中同一组关键词、只差文档长度的记忆——短记忆「数据库 配置」 vs
+长记忆「数据库 配置 + 240 字无关内容」：
+
+| 召回算法 | top-1 | 分数 |
+|---|---|---|
+| `overlap`（旧） | 长记忆（打平后按写入顺序） | 1.0 / 1.0 |
+| `bm25`（新） | **短记忆** | **2.89 / 1.15** |
+
+BM25 的文档长度归一化让「短而精确」的记忆胜出；这在记忆库里很常见——
+某条长记录顺带提了一句关键词，不应该压过一条专门讲这件事的短记录。
 
 离线演示（不需要 API key / 模型）：
 
@@ -415,7 +430,37 @@ memory:
 ```
 
 输出会展示：任务 A 写入 2 条记忆 → 任务 B 自动召回并拼出注入文本 → 无关问题不注入。
-单元测试见 `tests/test_memory.py`（7 条：持久化、同 key 覆盖、拒绝密钥、无重叠不召回、工具往返、注入截断、禁用）。
+单元测试见 `tests/test_memory.py`（11 条：持久化、同 key 覆盖、拒绝密钥、无重叠不召回、工具往返、
+注入截断、禁用、BM25 标注集 Recall@1=6/6、overlap 模式可回退、BM25 分数为正、长度归一化对照）。
+
+### 5.6 上下文压缩（字符预算）
+
+**问题**：ReAct 每一步都会把完整 `messages` 再送一次模型。步数一多，token 成本线性上涨，
+最终会撞上模型上下文上限。
+
+**设计**（`agent/context.py`）：
+
+- **只压内容、不删消息**：保留每条消息的 role / `tool_call_id` / `name` / `tool_calls`，
+  把早期正文替换成短占位——删除消息会破坏 `tool_calls ↔ ToolMessage` 的配对（协议要求）。
+- **保留骨架**：第一条用户任务原样保留，最近 `context_keep_last` 条原样保留。
+- **字符预算**：`max_context_chars` 是 token 的保守代理（中文约 1 字 ≈ 1 token）；
+  超预算时先按 `preview_chars` 压缩，再逐步收紧。
+- **可观测**：trace 记 `context_compressed`（before/after/compacted/kept）；
+  `RunResult.metrics` 增加 `context_saved_chars` / `context_compressions`。
+
+配置：
+
+```yaml
+agent:
+  max_context_chars: 12000   # 送模型前的字符预算
+  context_keep_last: 6       # 最近 N 条原样保留
+```
+
+实测（`tests/test_context.py`）：18 条消息（8 轮工具调用）在 2000 字符预算下，
+**2643 → 1824 字符（节省 31.0%）**，消息数保持 18 条、最近 3 条原样、协议配对完整。
+
+> 为什么不用 LLM 做摘要：摘要会额外调用模型（成本 + 不确定性），且单测不可复现；
+> 当前用确定性压缩，LLM 摘要留作后续可选项。
 
 ---
 
@@ -545,7 +590,8 @@ hello-agent/
 │   ├── resilience.py          # ★ 工具执行层：超时/重试/降级/熔断/限长
 │   ├── tools_builtin.py       # 计算器（AST 白名单）+ 当前时间
 │   ├── rag_tool.py            # ★ RAG 工具两形态（MCP 客户端 / 进程内直连 + fallback）
-│   ├── memory.py              # ★ 跨任务长期记忆：JSONL + 字面召回 + 注入 + 两个工具
+│   ├── memory.py              # ★ 跨任务长期记忆：JSONL + BM25 召回 + 注入 + 两个工具
+│   ├── context.py             # ★ 上下文压缩：字符预算 + 只压内容不删消息
 │   ├── eval_harness.py        # ★ 量化评测：完成率/工具选择/失败恢复/领域外诚实率
 │   ├── toolkit.py             # 工具集组装（auto/mcp/direct + memory）
 │   ├── trace.py               # ★ JSONL trace + 控制台摘要
@@ -556,7 +602,7 @@ hello-agent/
 │   └── eval_agent.py          # 批量评测 CLI（落 eval_results/*.json + *.md）
 ├── data/
 │   └── eval_queries.json      # 16 条评测 query（含分类与期望工具）
-├── tests/                     # 53 passed / 1 skipped（+9：记忆 7 + 并发 2；MCP 端到端需设环境变量）
+├── tests/                     # 60 passed / 1 skipped（+7：记忆 BM25 4 + 上下文 3；MCP 端到端需设环境变量）
 ├── traces/                    # 真实运行 trace（JSONL，可回放）
 └── docs/
     └── 讲解指南.md            # ★ 零基础讲解 + 面试问答模板（含「面试怎么讲」）
@@ -567,7 +613,7 @@ hello-agent/
 ## 11. 已知局限与下一步（不吹）
 
 **局限（如实说）**
-- 跨任务记忆的召回是**字面重叠**（英文词 + 中文单字/二元组），不是语义召回；
+- 跨任务记忆的召回是 **BM25**（词法召回，英文词 + 中文单字/二元组），不是语义召回；
   单机 JSONL 存储，未做多进程并发写锁与冲突合并；没有多 Agent / 任务规划；
 - 工具并发只针对同一轮内**互不依赖**的调用；有副作用的工具需要额外的串行约束
   （本项目工具均为只读或本地记忆写入，未做副作用补偿）；
@@ -575,8 +621,8 @@ hello-agent/
 - 每任务新建 MCP 会话，子进程启动 + 预热约 5s 未优化。
 
 **下一步（按优先级）**
-1. 记忆召回升级为语义/混合检索（复用 rag-eval-platform 的 BM25 + 向量 + RRF），并加 TTL / 去重；
-2. 上下文压缩：长任务的消息摘要，避免 `messages` 无限增长；
+1. 记忆召回升级为语义/混合检索（复用 rag-eval-platform 的向量 + RRF），并加 TTL / 去重；
+2. 上下文压缩升级为 LLM 摘要（当前是确定性的占位压缩，保证离线可复现）；
 3. MCP 会话复用 / 常驻进程，消除每任务 5s 的启动成本；
 4. 评测集扩到 50+ 条，按类别看指标（工具选择 / 失败恢复 / 领域外诚实），而不只看总体。
 

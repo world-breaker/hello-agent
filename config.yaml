@@ -10,6 +10,8 @@ agent:
   recursion_limit: 25     # LangGraph 图步数兜底（防御性上限，正常远达不到）
   parallel_tools: true    # 同一轮多个 tool_calls 并发执行（false 则退回串行）
   max_parallel_tools: 4   # 并发上限（asyncio.Semaphore），防止一次吐出过多调用打爆依赖
+  max_context_chars: 12000 # 送模型前的字符预算（粗略 token 代理）
+  context_keep_last: 6    # 最近 N 条消息原样保留，更早的消息压缩成短占位
   system_prompt: |
     你是一个严谨的助手，可以调用工具。规则：
     1) 需要事实依据时先检索知识库（search_knowledge），基于返回片段回答，不要凭记忆编造；
@@ -54,7 +56,10 @@ memory:
   enabled: true
   path: "./data/agent_memory.jsonl"   # 一行一条；同 key 后写覆盖
   tools: true              # 注册 remember_fact / recall_memory 两个工具
-  inject_top_k: 3          # 任务启动时按关键词召回、自动注入 system prompt 的条数
+  recall_mode: "bm25"      # bm25（默认，稀有词权重更高）| overlap（旧字面比例，便于 A/B）
+  bm25_k1: 1.5
+  bm25_b: 0.75
+  inject_top_k: 3          # 任务启动时按 BM25 召回、自动注入 system prompt 的条数
   max_inject_chars: 800    # 注入文本上限（控制上下文成本）
   max_content_chars: 2000  # 单条记忆长度上限
   max_records: 2000        # 超过后自动 compact（同 key 只留最新）

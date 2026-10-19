@@ -22,6 +22,7 @@ from langchain_core.messages import AIMessage, AnyMessage, SystemMessage, ToolMe
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 
+from agent.context import compress_messages
 from agent.resilience import ToolExecutor
 from agent.trace import Tracer
 
@@ -86,7 +87,16 @@ def build_agent_graph(
     async def agent_node(state: AgentState) -> Dict[str, Any]:
         tracer.next_step()
         step = tracer.step
-        messages = [SystemMessage(content=system_prompt)] + list(state["messages"])
+
+        # 送模型前压上下文：只压内容、不删消息（保住 tool_calls ↔ ToolMessage 配对）
+        history, context_stats = compress_messages(
+            list(state["messages"]),
+            max_chars=int(config["agent"].get("max_context_chars", 12000)),
+            keep_last=int(config["agent"].get("context_keep_last", 6)),
+        )
+        if context_stats.get("compressed"):
+            tracer.event("context_compressed", **context_stats)
+        messages = [SystemMessage(content=system_prompt)] + history
 
         started = time.perf_counter()
         try:

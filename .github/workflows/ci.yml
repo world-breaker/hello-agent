@@ -1,0 +1,64 @@
+# hello-agent 的 CI 门禁（通用 GitHub Actions 格式）。
+#
+# 宿主说明：本仓库当前托管在 **Gitee（私有仓库）**，Gitee 不会执行 GitHub Actions，
+# 所以本文件在 Gitee 侧只是"可执行的门禁声明"，镜像一份到 GitHub 即开即用
+# （Gitee Go 暂未接入，原因与做法见 README §7「CI 门禁」）。
+#
+# 三条环境变量都不是"仪式感"，各自对应一个真实踩过的坑：
+#   1) HF_HUB_OFFLINE / TRANSFORMERS_OFFLINE = 1
+#      测试全套本应离线（模型用 tests/fake_llm.py 的脚本化假模型）。
+#      设成离线是**硬保险**：真要有代码试图联网拉 BGE，它会直接失败，
+#      而不是在 CI 上静默下载几百 MB、把"绿"建立在一个没人看过的网络请求上。
+#   2) NO_PROXY / no_proxy 放行 127.0.0.1
+#      机器上挂了全局代理时，连 127.0.0.1 的请求也会被代理转发（实测回 502），
+#      rag 相关的回环用例会因此误报失败。
+#   3) PYTHONDONTWRITEBYTECODE=1
+#      不让 __pycache__ 混进工作区，免得干扰"改动文件清单"这类核对。
+
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: pytest (ubuntu-latest / Python 3.12)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      NO_PROXY: "127.0.0.1,localhost"
+      no_proxy: "127.0.0.1,localhost"
+      PYTHONIOENCODING: "utf-8"
+      PYTHONDONTWRITEBYTECODE: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Python 3.12（带 pip 缓存）
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: 安装依赖
+        run: python -m pip install -r requirements.txt
+
+      # 不需要任何密钥：LLM 走 tests/fake_llm.py 的脚本化假模型。
+      # 需要同源仓库 rag-mcp-server 的集成用例在 runner 上不存在该仓库，
+      # 会被测试里自带的 skipif 自动跳过（显式 skip，不是失败）。
+      # 本机（有兄弟仓库 + BGE 模型缓存）实测：81 passed, 1 skipped。
+      - name: 单元测试
+        run: python -m pytest -q -rs

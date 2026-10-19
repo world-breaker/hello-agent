@@ -688,6 +688,35 @@ trace 里也能直接看出来（这就是「客观证据」而不是口头声�
 | `tests/test_usage.py` | 单价查表与成本换算**精确值**、usage 抽取（`usage_metadata` / `response_metadata` 两条来源）、无用量时明示、runner 里 token/成本落 metrics 与控制台摘要、扫 trace 求和（累计层）、评测侧聚合成本 |
 | `tests/test_checkpoint_resume.py` | **续跑不重放已完成步骤**（sqlite 与自研 JSONL 两个后端同一套断言）、已收尾 thread 开新一轮、不给 thread_id 时完全不启用、显式 sqlite 缺依赖要报错而 auto 才允许降级、JSONL 落盘跨实例回读 |
 
+### CI 门禁（`.github/workflows/ci.yml`）
+
+那套测试有自动化门禁：`ubuntu-latest` + Python 3.12 + `pip` 依赖缓存 + `pytest -q -rs`，
+job 级设了离线变量，**不需要密钥、也不会下载模型**。
+
+> **宿主如实说明**：本仓库托管在 **Gitee（私有）**，Gitee 不会执行 GitHub Actions，也还没接 Gitee Go。
+> 这份 YAML 用的是**通用 GitHub Actions 格式**——镜像一份到 GitHub 即可直接生效，但在 Gitee 侧目前不是自动跑的流水线。
+> 因此 README 里**不放 CI 徽章**：私有/异源仓库的徽章只会 404。
+
+为什么这样设环境变量（每条都对着一个真实坑，不是仪式感）：
+
+| 环境变量 | 作用 |
+|---|---|
+| `HF_HUB_OFFLINE=1` / `TRANSFORMERS_OFFLINE=1` | CI 上没有 BGE 模型缓存：这两条让"试图联网拉模型"**直接失败**，而不是静默下载几百 MB、把绿灯建立在一个没人审过的网络请求上 |
+| `NO_PROXY=127.0.0.1,localhost` | 本机/CI 若挂了全局代理，连 `127.0.0.1` 的回环请求也会被代理转发（实测回 502）→ 显式放行回环 |
+| `PYTHONDONTWRITEBYTECODE=1` | 不让 `__pycache__` 干扰"改动文件清单"核对 |
+
+本地一键复现同一条门禁（照抄可跑）：
+
+```bash
+python -m pip install -r requirements.txt && python -m pytest -q -rs
+```
+
+```text
+# 本机（存在兄弟仓库 rag-mcp-server + BGE 缓存）：81 passed, 1 skipped in 12.34s
+# runner 上不存在兄弟仓库（= GitHub runner 的真实情形）：78 passed, 4 skipped in 3.87s
+#   —— 4 个集成用例走测试自带的 skipif 显式跳过（不是失败），见 tests/test_rag_tool.py
+```
+
 ---
 
 ## 8. 踩坑记录（都是真实遇到并修掉的）
@@ -735,6 +764,7 @@ hello-agent/
 ├── config.yaml                # 参数：max_steps / 并发 / 重试 / 熔断 / 记忆 / RAG 形态 / trace
 ├── .env.example               # 端点配置模板（.env 在 .gitignore，永不入库）
 ├── requirements.txt           # 固定版本依赖
+├── .github/workflows/ci.yml   # CI 门禁（通用 GitHub Actions 格式；宿主 Gitee → 镜像到 GitHub 生效，见 §7）
 ├── agent/
 │   ├── config.py              # 配置加载 + 密钥脱敏
 │   ├── llm.py                 # OpenAI 兼容端点装配

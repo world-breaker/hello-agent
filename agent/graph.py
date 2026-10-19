@@ -25,6 +25,7 @@ from langgraph.graph.message import add_messages
 from agent.context import compress_messages
 from agent.resilience import ToolExecutor
 from agent.trace import Tracer
+from agent.usage import extract_usage
 
 
 class AgentState(TypedDict):
@@ -62,10 +63,13 @@ def build_agent_graph(
     tracer: Tracer,
     config: Dict[str, Any],
     memory_context: str = "",
+    checkpointer: Any = None,
 ):
     """构建并编译 ReAct 图。
 
     memory_context：跨任务记忆（由 runner 从 MemoryStore 召回），非空时追加到 system prompt。
+    checkpointer：LangGraph 状态持久化（`agent/checkpointing.py`）。为 None 时行为与之前完全一致；
+        给了就在每个 super-step 结束后落一次状态，配合 `config.configurable.thread_id` 支持断点续跑。
     """
     max_steps = int(config["agent"]["max_steps"])
     system_prompt = str(config["agent"]["system_prompt"])
@@ -115,16 +119,13 @@ def build_agent_graph(
             }
 
         elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
-        usage = getattr(ai_message, "usage_metadata", None) or {}
+        # token 用量：优先 usage_metadata，退回 response_metadata.token_usage（见 agent/usage.py）
+        usage = extract_usage(ai_message)
         tracer.event(
             "llm_call",
             elapsed_ms=elapsed_ms,
             ok=True,
-            usage={
-                "input_tokens": usage.get("input_tokens"),
-                "output_tokens": usage.get("output_tokens"),
-                "total_tokens": usage.get("total_tokens"),
-            } if usage else None,
+            usage=usage,
         )
 
         tool_calls = [
@@ -208,4 +209,5 @@ def build_agent_graph(
     graph.add_edge(START, "agent")
     graph.add_conditional_edges("agent", route_after_agent, {"tools": "tools", "end": END})
     graph.add_edge("tools", "agent")
-    return graph.compile()
+    return graph.compile(checkpointer=checkpointer) if checkpointer is not None else graph.compile()
+

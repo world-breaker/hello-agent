@@ -31,6 +31,7 @@ class ScriptedChatModel(BaseChatModel):
     responses: List[AIMessage] = []
     cursor: int = 0
     bound_tools: List[str] = []
+    calls: int = 0   # 模型被调用的次数（断点续跑测试用它证明「前面几步没有被重放」）
 
     @property
     def _llm_type(self) -> str:
@@ -43,6 +44,7 @@ class ScriptedChatModel(BaseChatModel):
     def _next_message(self) -> AIMessage:
         index = min(self.cursor, len(self.responses) - 1)
         self.cursor += 1
+        self.calls += 1
         return self.responses[index]
 
     def _generate(

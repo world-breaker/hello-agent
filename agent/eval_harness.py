@@ -38,6 +38,11 @@ class EvalRecord:
     tool_success_rate: float | None
     used_tools: List[str] = field(default_factory=list)
     final_answer: str = ""
+    # 用量与成本（取自 run_end.metrics["usage"]，口径见 agent/usage.py）
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    estimated_cost_usd: float | None = None
 
 
 def load_eval_set(path: str | Path) -> List[Dict[str, Any]]:
@@ -119,6 +124,11 @@ def evaluate(records: List[EvalRecord]) -> Dict[str, Any]:
     sr_vals = [r.tool_success_rate for r in records if r.tool_success_rate is not None]
     avg_steps = sum(r.steps for r in records) / n
 
+    # 用量与成本：按「单条平均 + 总量」两个口径报（成本只统计命中单价表的条目）
+    priced = [r for r in records if r.estimated_cost_usd is not None]
+    total_tokens = sum(r.total_tokens for r in records)
+    total_cost = round(sum(float(r.estimated_cost_usd) for r in priced), 6) if priced else None
+
     def _rate(num: int, den: int) -> float | None:
         return round(num / den, 4) if den else None
 
@@ -130,6 +140,13 @@ def evaluate(records: List[EvalRecord]) -> Dict[str, Any]:
         "tool_selection_accuracy": _rate(len(sel_ok), len(labeled)),
         "failure_recovery_rate": _rate(len(recovered), len(had_failure)),
         "out_of_domain_honesty_rate": _rate(len(honest), len(ood)),
+        "total_prompt_tokens": sum(r.prompt_tokens for r in records),
+        "total_completion_tokens": sum(r.completion_tokens for r in records),
+        "total_tokens": total_tokens,
+        "avg_tokens_per_query": round(total_tokens / n, 1),
+        "total_cost_usd": total_cost,
+        "avg_cost_per_query_usd": round(total_cost / len(priced), 6) if priced else None,
+        "costed_n": len(priced),
         "by_category": {
             cat: {"total": d["total"], "completed": d["completed"], "rate": _rate(d["completed"], d["total"])}
             for cat, d in by_cat.items()
@@ -148,6 +165,12 @@ def render_markdown(summary: Dict[str, Any], records: List[EvalRecord]) -> str:
         lines.append(f"- 工具选择准确率（期望工具 ⊆ 实际使用）：**{summary['tool_selection_accuracy']}**")
         lines.append(f"- 失败恢复率（重试/降级后仍完成）：**{summary['failure_recovery_rate']}**")
         lines.append(f"- 领域外诚实率（不编造）：**{summary['out_of_domain_honesty_rate']}**")
+        lines.append(f"- 总 token：**{summary.get('total_tokens')}**"
+                     f"（in {summary.get('total_prompt_tokens')} / out {summary.get('total_completion_tokens')}），"
+                     f"平均 **{summary.get('avg_tokens_per_query')}** / 条")
+        lines.append(f"- 估算总成本：**${summary.get('total_cost_usd')}**"
+                     f"（{summary.get('costed_n')}/{summary.get('n')} 条命中单价表；平均 "
+                     f"${summary.get('avg_cost_per_query_usd')} / 条）")
         lines.append("")
         lines.append("## 分类别完成率")
         for cat, d in summary.get("by_category", {}).items():
@@ -155,11 +178,13 @@ def render_markdown(summary: Dict[str, Any], records: List[EvalRecord]) -> str:
     lines.append("")
     lines.append("## 逐条明细")
     lines.append("")
-    lines.append("| # | category | status | steps | tools | success_rate |")
-    lines.append("|---|---|---|---|---|---|")
+    lines.append("| # | category | status | steps | tokens | cost_usd | tools | success_rate |")
+    lines.append("|---|---|---|---|---|---|---|---|")
     for i, r in enumerate(records, 1):
         tools = ",".join(r.used_tools) or "—"
+        cost = "—" if r.estimated_cost_usd is None else f"{r.estimated_cost_usd:.6f}"
         lines.append(
-            f"| {i} | {r.query.get('category', '')} | {r.status} | {r.steps} | {tools} | {r.tool_success_rate} |"
+            f"| {i} | {r.query.get('category', '')} | {r.status} | {r.steps} | {r.total_tokens} "
+            f"| {cost} | {tools} | {r.tool_success_rate} |"
         )
     return "\n".join(lines)

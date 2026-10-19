@@ -16,3 +16,11 @@ logs/
 data/agent_memory.jsonl
 data/demo_memory.jsonl
 eval_results/
+
+# 运行产物：断点续跑的 checkpoint / 续跑与用量演示产物（本地生成，不入库）
+data/checkpoints.sqlite*
+data/checkpoints.jsonl*
+data/demo_resume*.sqlite*
+data/demo_resume*.jsonl*
+data/demo_resume_traces/
+

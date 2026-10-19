@@ -18,6 +18,12 @@ python-dotenv==1.2.4
 PyYAML==6.0.3
 tzdata==2026.5
 
+# 断点续跑：官方 Checkpoint Saver（thread_id 为续跑键，落一个本地 sqlite 文件）
+# 不装也能跑：backend=auto 会自动降级到「MemorySaver + JSONL 落盘」（agent/checkpointing.py 自研实现）
+langgraph-checkpoint-sqlite==3.1.2
+aiosqlite==0.22.1
+sqlite-vec==0.1.9
+
 # 测试
 pytest==9.1.1
 

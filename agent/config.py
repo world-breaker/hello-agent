@@ -20,10 +20,24 @@ DEFAULTS: Dict[str, Any] = {
         "temperature": 0.0,
         "timeout_s": 60,
         "max_retries": 2,
+        # token 单价表（USD / 1M tokens，按模型名匹配）——成本估算用；
+        # 没命中的模型只报 token 不报钱（见 agent/usage.py）。数值会随厂商调价变化，改这里而不是改代码。
+        "pricing": {
+            "deepseek-chat": {"input": 0.27, "output": 1.10},
+            "deepseek-reasoner": {"input": 0.55, "output": 2.19},
+            "gpt-4o-mini": {"input": 0.15, "output": 0.60},
+        },
     },
     "agent": {
         "max_steps": 6,
         "recursion_limit": 25,
+        # 断点续跑（LangGraph checkpointer）：只有显式给 thread_id 时才真正挂载，
+        # 所以默认（run.py 不带 --thread-id）行为与加这个功能之前完全一致。
+        "checkpoint": {
+            "enabled": True,
+            "backend": "auto",  # auto（优先官方 sqlite，不可用退 jsonl）| sqlite | jsonl
+            "path": "./data/checkpoints.sqlite",
+        },
         # 同一轮模型返回多个 tool_calls 时是否并发执行（Semaphore 限流）
         "parallel_tools": True,
         "max_parallel_tools": 4,
@@ -150,6 +164,13 @@ def load_config(path: str | Path | None = None) -> Dict[str, Any]:
     if not memory_path.is_absolute():
         memory_path = config_path.parent / memory_path
     config["memory"]["path"] = str(memory_path.resolve())
+
+    # 断点续跑的 checkpointer 落盘路径同理（jsonl 后端会换成同名 .jsonl）
+    checkpoint_cfg = config["agent"].get("checkpoint") or {}
+    checkpoint_path = Path(str(checkpoint_cfg.get("path", "./data/checkpoints.sqlite")))
+    if not checkpoint_path.is_absolute():
+        checkpoint_path = config_path.parent / checkpoint_path
+    config["agent"]["checkpoint"] = {**checkpoint_cfg, "path": str(checkpoint_path.resolve())}
 
     # RAG 相关相对路径同样解析成绝对路径
     rag_cfg = config["tools"]["rag"]

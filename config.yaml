@@ -4,10 +4,22 @@ llm:
   temperature: 0.0        # Agent 要可复现：温度尽量低
   timeout_s: 60           # 单次模型调用超时
   max_retries: 2          # 模型 HTTP 层重试（网络抖动/限流）——与工具层重试相互独立
+  # token 单价表：成本估算用（USD / 1M tokens），按模型名精确匹配；没命中的模型只报 token 不报钱。
+  # 单价会随厂商调价变，所以是配置项：改这里，而不是改代码（2025-08 的公开价）。
+  pricing:
+    deepseek-chat:      {input: 0.27, output: 1.10}
+    deepseek-reasoner:  {input: 0.55, output: 2.19}
+    gpt-4o-mini:        {input: 0.15, output: 0.60}
 
 agent:
   max_steps: 6            # ★ 业务上的最大步数：一轮 = 模型思考 + 工具执行
   recursion_limit: 25     # LangGraph 图步数兜底（防御性上限，正常远达不到）
+  # 断点续跑（LangGraph checkpointer）：以 thread_id 为续跑键。
+  # 只有显式给 thread_id（run.py --thread-id / --resume）时才真正挂载 → 默认行为不变。
+  checkpoint:
+    enabled: true
+    backend: auto         # auto（优先官方 sqlite，依赖不可用则退 JSONL）| sqlite | jsonl
+    path: "./data/checkpoints.sqlite"   # jsonl 后端会自动换成同名的 .jsonl
   parallel_tools: true    # 同一轮多个 tool_calls 并发执行（false 则退回串行）
   max_parallel_tools: 4   # 并发上限（asyncio.Semaphore），防止一次吐出过多调用打爆依赖
   max_context_chars: 12000 # 送模型前的字符预算（粗略 token 代理）

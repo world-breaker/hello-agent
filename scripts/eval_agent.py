@@ -48,6 +48,7 @@ async def main() -> int:
         print(f"\n[{idx}/{len(queries)}] {q['task'][:60]}…")
         res = await run_task(q["task"], config=config, rag_mode=args.rag_mode)
         m = res.metrics or {}
+        usage = m.get("usage") or {}
         used = extract_tool_names(res.trace_path)
         records.append(
             EvalRecord(
@@ -63,6 +64,10 @@ async def main() -> int:
                 tool_success_rate=m.get("tool_success_rate"),
                 used_tools=used,
                 final_answer=res.final_answer,
+                prompt_tokens=usage.get("prompt_tokens", 0),
+                completion_tokens=usage.get("completion_tokens", 0),
+                total_tokens=usage.get("total_tokens", 0),
+                estimated_cost_usd=usage.get("estimated_cost_usd"),
             )
         )
 

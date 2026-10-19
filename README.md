@@ -12,10 +12,12 @@
 
 | 项目 | 事实 | 证据位置 |
 |---|---|---|
-| 离线测试 | `60 passed / 1 skipped`（MCP 端到端测试用环境变量开启） | §7 |
+| 离线测试 | `81 passed / 1 skipped`（MCP 端到端测试用环境变量开启） | §7 |
 | 真实任务 | 三条 demo 全部 `status=completed`（步数 3 / 4 / 2，总耗时 30.97s） | §1 |
 | 最大步数 | `--max-steps 1` 稳定得到「未完成收尾」，不会假完成 | §1.3 |
 | 降级 | 把 MCP 命令改坏后，`auto` 模式如实降级到进程内直连并完成任务 | §1.4 |
+| 成本 | 一次多步任务的 token 与估算成本落进 `metrics.usage`，累计可扫 trace 重算 | §5.7 |
+| 断点续跑 | 同 `thread_id` 重跑：**重放步数 = 0**，只补跑失败的那一步（sqlite / JSONL 两个后端） | §5.8 |
 | trace | 每个任务一份 JSONL，逐行可回放（含 token 用量与工具成功率） | §6 |
 
 ---
@@ -169,6 +171,8 @@ flowchart TB
         TL["tools 节点<br/>执行工具 + 记录 observation"]
         EX["ToolExecutor（执行层）<br/>超时20s / 重试×3 / 降级 / 熔断 / 结果限长1200字符"]
         TR["Tracer（观测层）<br/>JSONL 事件流 + 控制台摘要 + 指标"]
+        US["usage（用量与成本）<br/>llm_call.usage → metrics.usage"]
+        CP["checkpointer（断点续跑）<br/>sqlite / JSONL，thread_id 为键"]
     end
 
     subgraph Tools["工具层"]
@@ -193,6 +197,9 @@ flowchart TB
     EX --> C3
     RT -- "收尾" --> TR
     AG --> TR
+    AG --> US
+    AG -. "每个 super-step 落一次状态" .-> CP
+    CP -. "同 thread_id 重跑：只补跑未完成节点" .-> AG
     EX --> TR
     TL --> AG
     C3 -- "MCP JSON-RPC over stdio" --> SRV --> IDX
@@ -206,7 +213,9 @@ flowchart TB
 3. `graph.build_agent_graph()` 编译状态图，并把**工具 schema 绑定到模型**（`llm.bind_tools`）；
 4. 循环：`agent` 节点调模型 → 有工具调用就去 `tools` 节点逐个执行（每次都过 ToolExecutor 的超时/重试/熔断）→ 结果作为 `ToolMessage` 回到 `agent`；
 5. 结束条件三选一：模型不再调工具（`completed`）/ 步数用尽（`max_steps_exceeded`）/ 模型故障（`llm_error`）；
-6. `runner` 收尾：生成最终回答 + 聚合指标 + 写 `run_end` 事件；`run.py` 用退出码表达结果（completed=0，其余=1）。
+6. `runner` 收尾：生成最终回答 + 聚合指标（工具统计 + `usage` 用量成本 + 续跑信息）+ 写 `run_end` 事件；
+   `run.py` 用退出码表达结果（completed=0，其余=1）；
+7. 给了 `thread_id` 时图外还挂了 checkpointer：每个 super-step 落一次状态，进程挂了也能用同一 `thread_id` 续跑（见 §5.8）。
 
 ---
 
@@ -277,7 +286,11 @@ copy .env.example .env
 .venv\Scripts\python.exe run.py "任意任务" --rag-mode mcp      # 强制 MCP（连不上直接报错，用于验证链路）
 .venv\Scripts\python.exe run.py "任意任务" --max-steps 3       # 覆盖最大步数
 .venv\Scripts\python.exe run.py "任意任务" --console verbose   # 控制台连最终回答一起打
+.venv\Scripts\python.exe run.py "任意任务" --thread-id demo-1  # 断点续跑：同 thread 有未完成状态就接着跑
+.venv\Scripts\python.exe run.py --list-threads                 # 列出 checkpoint 里的 thread
 .venv\Scripts\python.exe scripts\demo_tasks.py                 # 跑三条固定 demo
+.venv\Scripts\python.exe scripts\demo_resume.py                # 断点续跑演示（离线，重放步数=0）
+.venv\Scripts\python.exe scripts\usage_report.py               # 扫 trace 汇总 token 与成本
 ```
 
 退出码：`0` = `completed`；`1` = 未完成（`max_steps_exceeded` / `llm_error` / `error`）；`2` = 配置缺失（没填 `.env`）。
@@ -462,6 +475,139 @@ agent:
 > 为什么不用 LLM 做摘要：摘要会额外调用模型（成本 + 不确定性），且单测不可复现；
 > 当前用确定性压缩，LLM 摘要留作后续可选项。
 
+### 5.7 token 用量与成本估算
+
+**问题**：Agent 每步都要重发上下文，一次任务的成本是「步数 × 上下文长度」的函数——不量化就没法优化，
+也不能回答面试官最爱问的那句「**你这个 Agent 跑一次多少钱**」。
+
+**设计**（`agent/usage.py`）：
+
+| 层次 | 口径 | 落在哪 |
+|---|---|---|
+| 单任务 | 这一次运行累加的 in/out tokens、模型调用次数（有用量/无用量分别计） | `run_end.metrics["usage"]`、控制台一行摘要 |
+| 累计 | 扫 `traces/*.jsonl` 重算并求和（次数、总 token、平均、总成本） | `scripts/usage_report.py`（可导出 json/md） |
+
+三个刻意的取舍：
+
+1. **事实源是 trace，不是内存账本**：`summarize_usage(events)` 是纯函数，成本任何时刻都能对已落盘的
+   JSONL 重算（换单价表、复查某次为什么贵、把某次运行单独摘出来算），所以不存在「账本和 trace 对不上」；
+2. **算不出价就只报 token，绝不编数**：单价表是配置项（`config.yaml → llm.pricing`，按模型名匹配），
+   没命中时 `estimated_cost_usd = None`，控制台明确写「不在单价表，仅报 token」；
+3. **端点不返回用量时明示**：`llm_calls_without_usage` 单独计数，而不是把「没有数据」当成 0 悄悄算进成本。
+
+```yaml
+llm:
+  pricing:                      # USD / 1M tokens，按模型名精确匹配（可加 "*" 通配兜底）
+    deepseek-chat:     {input: 0.27, output: 1.10}
+    deepseek-reasoner: {input: 0.55, output: 2.19}
+```
+
+provider 差异也做了兜底：优先读 LangChain 统一后的 `usage_metadata`，
+退回读 `response_metadata.token_usage`（OpenAI 原生 `prompt_tokens/completion_tokens` 口径），
+两者都没有就记「本次无用量」——`extract_usage()` 有专门单测。
+
+**实测**（`scripts/demo_resume.py` 的两次 trace，`scripts/usage_report.py` 扫出来）：
+
+```text
+[ 1] run=4461fc97 model=deepseek-chat status=interrupted（无 run_end） steps=None tokens in/out=1720/83 合计=1803 成本=$0.000556
+[ 2] run=aee099e5 model=deepseek-chat status=completed               steps=3    tokens in/out=1100/60 合计=1160 成本=$0.000363
+累计：2 次运行，2963 tokens，估算成本 $0.000919（2 次命中单价表）
+```
+
+> 数字来源要说清：本机没有 `.env`/密钥，所以这条链路是用**脚本化假模型**跑出来的确定性数字
+> （token 值写死在 `scripts/demo_resume.py` 里，用来验证统计与换算，不是真实计费）；
+> 真实端点下 usage 由 provider 返回，同一套代码路径不变（`tests/test_usage.py` 断言了精确换算：
+> 400 in / 30 out × deepseek-chat 单价 = `$0.000141`）。
+> 第 1 行 `steps=None` 是因为那次运行被中断、没有写 `run_end`——报告如实标成
+> `interrupted（无 run_end）`，而不是补一个假数字。
+
+### 5.8 断点续跑（LangGraph checkpointer）
+
+**问题**：`messages / steps / status` 只活在内存里。进程一挂（Ctrl-C、OOM、部署重启、断网），
+整轮任务白跑；更糟的是**已执行过的工具调用会被重放**——对有副作用的工具（写文件、下单、发消息）
+这就是真金白银的损失。
+
+**设计**（`agent/checkpointing.py`）：给图装 checkpointer，以 `thread_id` 为续跑键。
+
+```mermaid
+flowchart LR
+    A["第 1 次运行<br/>step1 ✅ → step2 工具执行中进程被杀"] -->|"checkpoint（每个 super-step 一次）"| DB[("sqlite / jsonl<br/>thread_id=xxx")]
+    DB --> B["同 thread_id 重跑"]
+    B --> C{"snapshot.next 非空?"}
+    C -->|"是（图停在中间）"| D["input=None<br/>只补跑未完成节点<br/>→ step1 不重放"]
+    C -->|"否（已到 END）"| E["当作新一轮：追加新任务消息"]
+```
+
+后端按优先级自动选（`agent.checkpoint.backend`）：
+
+| backend | 实现 | 取舍 |
+|---|---|---|
+| `sqlite`（auto 时优先） | 官方 `langgraph-checkpoint-sqlite` 的 `AsyncSqliteSaver` | 进程级持久化、公共 API 最稳；单文件单机，多 Worker 场景要换 PostgresSaver |
+| `jsonl` | **本仓库自己实现的 `JsonlCheckpointer`**（`InMemorySaver` 子类 + JSONL 落盘） | 少一个依赖也能续跑；复用官方 `serde`（`JsonPlusSerializer`）序列化，所以 `messages` 里的 LangChain 消息对象能原样回读；全量重写快照（状态只有 KB 级），原子写盘（tmp + `os.replace`） |
+
+**为什么自己写一个 JSONL saver**：不是为了炫技，而是 ① 离线/轻量环境没有官方 sqlite 包时要有等价能力；
+② 只有 ~100 行，且**官方与自研两个后端跑同一套续跑测试**（`tests/test_checkpoint_resume.py` 参数化两遍），
+把「自研实现与官方语义一致」变成回归测试；③ 正好能讲清 checkpoint 的本质：
+「每个 super-step 后的状态快照 + 用 `versions_seen` 判断哪些节点已经消化过当前版本」。
+
+**线程 / 恢复语义**（面试常问，写清楚）：
+
+| 情况 | 行为 |
+|---|---|
+| 不给 `thread_id` | **不挂 checkpointer**，行为与加这个功能之前完全一致（`metrics.checkpoint_backend=disabled`） |
+| 给了 `thread_id`，且该 thread 有未完成状态（`snapshot.next` 非空） | **自动续跑**：`input=None`，只补跑未完成节点；已完成的步骤与工具调用不重放 |
+| 给了 `thread_id`，该 thread 已到 END | 视为**同一 thread 的新一轮**：只追加新任务消息，不重置 `steps`（同 thread = 一段会话） |
+| `--resume` 但没东西可续 | 记 `resume_noop` 事件并提示，按新任务开始（不静默） |
+| 续跑起点 | `RunResult.resumed / resumed_from_step`、`metrics.steps_this_run`；trace 的 `step` 号接着上次数 |
+
+```bash
+.venv\Scripts\python.exe run.py "长任务……" --thread-id order-42   # 有未完成状态就自动续跑
+.venv\Scripts\python.exe run.py "长任务……" --thread-id order-42 --resume
+.venv\Scripts\python.exe run.py --list-threads                     # 看看有哪些 thread、各有多少 checkpoint
+```
+
+**实测硬证据**（`scripts/demo_resume.py --backend sqlite`，两个后端跑出来一致）：
+
+```text
+[中断] SimulatedCrash: 模拟：工具执行中进程被中断（Ctrl-C / kill）（异常逃出 run_task，等价于进程结束）
+[第 1 次运行结束] 工具调用计数：{'calculator': 1, 'crashy': 1}；模型被调用 2 次
+===== 指标：步数=3（本次执行 1） 工具调用=1 ... =====
+===== 用量：tokens in=1100 out=60 合计=1160 | 估算成本=$0.000363 USD | 步数=3 status=completed =====
+===== 断点续跑：thread_id=demo-resume 后端=sqlite 本次是否续跑=是（从第 2 步后继续） =====
+1) calculator 调用次数：第 1 次运行 1 → 第 2 次运行 1（增量 0，即第 1 步没有被重放）
+2) crashy 调用次数：第 1 次运行 1 → 第 2 次运行 2（增量 1，只补跑了失败的那一步）
+3) 模型调用次数：第 1 次运行 2 次 → 第 2 次运行 1 次（第 2 次只花在收尾上，没有把前面两步重算一遍）
+重放步数 = 0（0 表示已完成的步骤没有被重放）
+```
+
+trace 里也能直接看出来（这就是「客观证据」而不是口头声明）：
+
+```text
+--- run_..._4461fc97.jsonl（被中断的那次）
+  step=1 llm_call usage={'input_tokens': 820, ...}    ← 第 1 步正常完成
+  step=1 thought calls=['calculator'] / action / observation
+  step=2 llm_call / thought calls=['crashy'] / action  ← 停在这里，没有 observation（进程被杀）
+--- run_..._aee099e5.jsonl（同 thread_id 续跑）
+  step=2 resume_detected next=['tools'] steps_done=2   ← 判据：图停在 tools 节点前
+  step=2 action / observation                          ← 只补跑了失败的这一步
+  step=3 llm_call / thought calls=[] / run_end status=completed steps=3 resumed=True
+```
+
+**中断是怎么造出来的（可复现）**：模型换成脚本化假模型（步数确定），
+一个工具在第 1 次调用时抛 `BaseException`——`ToolExecutor` 只兜 `Exception`，
+所以它直接逃出 `run_task`，等价于「执行到一半进程被 kill」；
+然后**换一个新的 checkpointer 实例**（模拟新进程）用同一个 `thread_id` 再跑一次。
+真实 Ctrl-C 的时机不可控，这样构造才能既确定性又贴近真实故障。
+
+**局限（不吹）**：
+- checkpoint 持久化的是**状态**，不是**副作用**：工具副作用不保证幂等
+  （崩溃窗口内写文件/下单这类操作仍可能被执行两次），要幂等键或「先写意图再执行」的补偿逻辑；
+- SQLite 单文件、单机、无跨节点协调；JSONL 后端是「全量重写快照」的实现，
+  状态很大或高并发时应该换 `AsyncSqliteSaver`/`PostgresSaver`；
+- 本机演示用的是「工具抛异常」模拟中断，**没有**验证「机器断电 / SIGKILL 落在写盘那一刻」的极端情况
+  （JSONL 后端用 tmp + `os.replace` 保证文件要么是旧的完整快照、要么是新的完整快照）。
+
+
 ---
 
 ## 6. 结构化 trace
@@ -471,15 +617,17 @@ agent:
 
 | type | 含义 |
 |---|---|
-| `run_start` | 任务开始：任务文本、**脱敏后的**端点信息（`api_key=sk-****`）、max_steps、rag_mode |
+| `run_start` | 任务开始：任务文本、**脱敏后的**端点信息（`api_key=sk-****`）、max_steps、rag_mode、`thread_id` |
 | `toolset` / `toolset_fallback` / `tools_ready` | 工具集就绪：MCP 连接耗时（`connect_ms`）、工具名、降级原因 |
-| `llm_call` | 一次模型调用：耗时 + token 用量（`input_tokens/output_tokens`） |
+| `checkpoint_ready` | 断点续跑就绪：后端（`sqlite` / `jsonl` / `disabled`）、thread_id、落盘路径、降级说明 |
+| `resume_detected` / `resume_noop` | 检测到未完成状态（含 `next_nodes` / `steps_done`）→ 本次是续跑；或 `--resume` 但没东西可续 |
+| `llm_call` | 一次模型调用：耗时 + token 用量（`input_tokens/output_tokens/total_tokens`） |
 | `thought` | 模型这一轮的文本 + 请求的工具调用列表 |
 | `action` | 发起一次工具调用（含 `attempt` 序号；重试会出现多条） |
 | `retry` | 一次可重试失败 + 退避秒数 |
 | `observation` | 工具结果：成功给截断预览；失败给 `error_class` 与可操作建议 |
 | `degrade` / `circuit_open` | 降级 / 熔断触发 |
-| `max_steps_reached` / `run_end` | 收尾：状态、步数、最终回答、指标（含 `tool_success_rate`） |
+| `max_steps_reached` / `run_end` | 收尾：状态、步数（含 `steps_this_run`）、最终回答、指标（`tool_success_rate`、`usage` 用量与成本） |
 
 真实事件示例（取自 `traces/run_20261016-132218_3941a1d2.jsonl`；为可读性省略了若干字段——
 `toolset` 的 `command / server_script`、`run_end.metrics.event_counts` 等，其余逐字保留）：
@@ -495,7 +643,8 @@ agent:
 三条工程纪律：
 
 1. **密钥永不落盘**：所有字符串过 `mask_secret()`，trace 里只有 `sk-****`；有测试用例守着（`test_trace_never_leaks_api_key`）；
-2. **指标现成可聚合**：`run_end.metrics` 里已有 `tool_calls / tool_ok / tool_failed / tool_retries / tool_degraded / circuit_opens / tool_success_rate / event_counts`——后续做「工具选择正确率 / 平均步数」评测时直接复用；
+2. **指标现成可聚合**：`run_end.metrics` 里已有 `tool_calls / tool_ok / tool_failed / tool_retries / tool_degraded / circuit_opens / tool_success_rate / event_counts`
+   以及 `usage`（token 与估算成本，见 §5.7）、`thread_id / resumed / steps_this_run`（见 §5.8）——后续做「工具选择正确率 / 平均步数 / 单任务成本」评测时直接复用；
 3. **控制台与文件分离**：控制台只打摘要（每条截断 200 字符），文件保留完整事件；`--console quiet|summary|verbose` 可切换。
 
 ---
@@ -506,8 +655,8 @@ agent:
 
 ```text
 > .venv\Scripts\python.exe -m pytest -q
-......................s..................                                [100%]
-40 passed, 1 skipped in 8.38s
+........................................................................s......................          [100%]
+81 passed, 1 skipped in 10.84s
 ```
 
 把 MCP 端到端用例也打开（它会拉起 rag-mcp-server 子进程并加载 BGE 模型，约 10s）：
@@ -515,12 +664,13 @@ agent:
 ```text
 > set HELLO_AGENT_TEST_MCP=1
 > .venv\Scripts\python.exe -m pytest -q
-.........................................                                [100%]
-41 passed in 14.74s
+........................................................................ [ 87%]
+..........                                                               [100%]
+82 passed in 28.63s
 
 > .venv\Scripts\python.exe -m pytest -q -k mcp_form     # 只跑那一条
 .                                                                        [100%]
-1 passed, 40 deselected in 7.48s
+1 passed, 81 deselected in 13.58s
 ```
 
 **测试怎么测一个「概率性系统」**：把模型替换成**脚本化假模型** `tests/fake_llm.py`
@@ -535,6 +685,8 @@ agent:
 | `tests/test_runner.py` | 完成态的 trace 与指标、`max_steps_exceeded` 的说明文案、缺 `.env` 时的可读报错 |
 | `tests/test_trace.py` | JSONL 字段完整、**密钥不泄漏**、控制台预览截断、一次任务一个文件 |
 | `tests/test_rag_tool.py` | direct 形态契约、fallback 契约、auto 降级、**MCP 端到端**（需环境变量） |
+| `tests/test_usage.py` | 单价查表与成本换算**精确值**、usage 抽取（`usage_metadata` / `response_metadata` 两条来源）、无用量时明示、runner 里 token/成本落 metrics 与控制台摘要、扫 trace 求和（累计层）、评测侧聚合成本 |
+| `tests/test_checkpoint_resume.py` | **续跑不重放已完成步骤**（sqlite 与自研 JSONL 两个后端同一套断言）、已收尾 thread 开新一轮、不给 thread_id 时完全不启用、显式 sqlite 缺依赖要报错而 auto 才允许降级、JSONL 落盘跨实例回读 |
 
 ---
 
@@ -592,17 +744,22 @@ hello-agent/
 │   ├── rag_tool.py            # ★ RAG 工具两形态（MCP 客户端 / 进程内直连 + fallback）
 │   ├── memory.py              # ★ 跨任务长期记忆：JSONL + BM25 召回 + 注入 + 两个工具
 │   ├── context.py             # ★ 上下文压缩：字符预算 + 只压内容不删消息
-│   ├── eval_harness.py        # ★ 量化评测：完成率/工具选择/失败恢复/领域外诚实率
+│   ├── usage.py               # ★ token 用量与成本估算（参数化单价表 + 纯函数聚合）
+│   ├── checkpointing.py       # ★ 断点续跑：官方 sqlite saver + 自研 JSONL saver（thread_id 为键）
+│   ├── eval_harness.py        # ★ 量化评测：完成率/工具选择/失败恢复/领域外诚实率/成本
 │   ├── toolkit.py             # 工具集组装（auto/mcp/direct + memory）
 │   ├── trace.py               # ★ JSONL trace + 控制台摘要
-│   └── runner.py              # 任务装配、收尾、指标聚合
+│   └── runner.py              # 任务装配、收尾、指标聚合（用量 / 续跑）
 ├── scripts/
 │   ├── demo_tasks.py          # 三条固定 demo（证据生成器）
 │   ├── demo_memory.py         # 跨任务记忆离线演示（不需要 API key）
+│   ├── demo_resume.py         # 断点续跑离线演示：模拟中断 → 同 thread_id 续跑（重放步数=0）
+│   ├── usage_report.py        # 扫 trace 汇总 token / 成本（单次 + 累计，可导出 json/md）
 │   └── eval_agent.py          # 批量评测 CLI（落 eval_results/*.json + *.md）
 ├── data/
 │   └── eval_queries.json      # 16 条评测 query（含分类与期望工具）
-├── tests/                     # 60 passed / 1 skipped（+7：记忆 BM25 4 + 上下文 3；MCP 端到端需设环境变量）
+├── tests/                     # 81 passed / 1 skipped（+21：用量成本 13 + 断点续跑 8；MCP 端到端需设环境变量）
+│                              #   checkpoint / 演示产物落 data/ 已 gitignore
 ├── traces/                    # 真实运行 trace（JSONL，可回放）
 └── docs/
     └── 讲解指南.md            # ★ 零基础讲解 + 面试问答模板（含「面试怎么讲」）
@@ -617,6 +774,12 @@ hello-agent/
   单机 JSONL 存储，未做多进程并发写锁与冲突合并；没有多 Agent / 任务规划；
 - 工具并发只针对同一轮内**互不依赖**的调用；有副作用的工具需要额外的串行约束
   （本项目工具均为只读或本地记忆写入，未做副作用补偿）；
+- 断点续跑只保证**状态**可恢复，**副作用不保证幂等**（崩溃窗口内工具可能被执行两次）；
+  checkpoint 是单机单文件（sqlite / JSONL），没有跨节点协调与并发写保护（详见 §5.8 局限）；
+- 成本是**估算**：单价表手工维护、按模型名精确匹配，缓存命中价 / 阶梯价 / 汇率都没建模；
+  端点不返回 usage 时只能记「无用量」，不猜；
+- **本机没有 `.env`/密钥**，所以 §5.7 / §5.8 里的 token 与成本实测数字来自脚本化假模型
+  （确定性、可复现），真实端点的端到端跑批留给有 key 的环境；
 - 评测集 16 条，规模小，指标只用于回归参考，不代表线上分布；
 - 每任务新建 MCP 会话，子进程启动 + 预热约 5s 未优化。
 
@@ -624,7 +787,8 @@ hello-agent/
 1. 记忆召回升级为语义/混合检索（复用 rag-eval-platform 的向量 + RRF），并加 TTL / 去重；
 2. 上下文压缩升级为 LLM 摘要（当前是确定性的占位压缩，保证离线可复现）；
 3. MCP 会话复用 / 常驻进程，消除每任务 5s 的启动成本；
-4. 评测集扩到 50+ 条，按类别看指标（工具选择 / 失败恢复 / 领域外诚实），而不只看总体。
+4. 评测集扩到 50+ 条，按类别看指标（工具选择 / 失败恢复 / 领域外诚实）+ 成本，而不只看总体；
+5. 续跑再接一层「工具幂等键」（副作用去重），把 checkpoint 从「状态一致」推到「副作用一致」。
 
 ---
 

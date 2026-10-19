@@ -1,13 +1,13 @@
 """单条任务的执行入口：组装配置 → 工具 → 模型 → 图 → 跑 → 收尾落 trace。"""
 
 import asyncio
-import json
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage
 
+from agent.checkpointing import open_checkpointer
 from agent.config import describe_llm, get_llm_settings, load_config
 from agent.graph import build_agent_graph
 from agent.llm import build_llm
@@ -15,6 +15,7 @@ from agent.memory import build_memory_context
 from agent.resilience import ToolExecutor
 from agent.toolkit import build_toolset
 from agent.trace import Tracer
+from agent.usage import format_usage_line, load_pricing, summarize_usage
 
 # 结束状态的取值（对外契约，README 与测试都按这个口径）
 STATUS_COMPLETED = "completed"
@@ -34,6 +35,11 @@ class RunResult:
     rag_mode: str
     metrics: Dict[str, Any] = field(default_factory=dict)
     error: str | None = None
+    # 断点续跑相关（不指定 thread_id 时 thread_id=None / resumed=False）
+    thread_id: str | None = None
+    resumed: bool = False
+    resumed_from_step: int = 0
+    usage: Dict[str, Any] = field(default_factory=dict)
 
 
 def _text_of(message: AnyMessage) -> str:
@@ -97,13 +103,59 @@ def _failure_explanation(state: Dict[str, Any], max_steps: int) -> str:
     return "\n".join(lines)
 
 
+async def _detect_resume(graph, invoke_config: Dict[str, Any], tracer: Tracer,
+                         thread_id: str, resume: bool) -> tuple[bool, int, bool]:
+    """判断这个 thread 上的 checkpoint 处于什么状态。
+
+    判据用 LangGraph 自己的 `StateSnapshot.next`：**有下一个待执行节点 = 上次没跑完**
+    （节点执行完但进程被杀/Ctrl-C，图停在中间）。`next` 为空说明上次已到 END。
+    这个判据比读 `status` 字段可靠：`max_steps_exceeded` 收尾时 status 也是 in_progress，
+    但图已经到 END，不该被当成「可以续跑」。
+
+    返回 `(是否续跑, 已完成的步数, 这个 thread 之前有没有消息)`。
+    """
+    snapshot = await graph.aget_state(invoke_config)
+    if snapshot is None:
+        return False, 0, False
+    pending_nodes = list(getattr(snapshot, "next", ()) or ())
+    values = snapshot.values or {}
+    steps_before = int(values.get("steps", 0) or 0)
+    has_history = bool(values.get("messages"))
+    tracer.step = steps_before  # trace 的步号接着上次，复盘时能看出「第几步是续跑/新一轮」
+    if pending_nodes:
+        tracer.event(
+            "resume_detected",
+            thread_id=thread_id,
+            next_nodes=pending_nodes,
+            steps_done=steps_before,
+            messages_done=len(values.get("messages") or []),
+        )
+        return True, steps_before, has_history
+    if resume:
+        tracer.event(
+            "resume_noop",
+            thread_id=thread_id,
+            reason="该 thread 没有未完成的 checkpoint（上次已到 END），本次按新任务开始",
+        )
+    return False, steps_before, has_history
+
+
 async def run_task(
     task: str,
     config: Dict[str, Any] | None = None,
     rag_mode: str | None = None,
     console: str | None = None,
+    thread_id: str | None = None,
+    resume: bool = False,
 ) -> RunResult:
-    """跑一条任务，返回结构化结果（trace 落在 traces/ 下）。"""
+    """跑一条任务，返回结构化结果（trace 落在 traces/ 下）。
+
+    thread_id：给了就挂 checkpointer（断点续跑），且本次运行属于这个 thread；
+        若该 thread 上有「没跑完」的状态（上次中断/Ctrl-C），**自动从最后一个完成的步骤续跑**，
+        input 传 None 让 LangGraph 只补跑未完成的节点 → 已完成的工具调用不会被重放。
+    resume：把「续跑」这件事显式化（CLI `--resume`）。即使不加，只要检测到未完成状态也会续跑，
+        因为这个参数只影响「没有可续跑状态时」的提示行为，不影响正常任务。
+    """
     config = config or load_config()
     settings = get_llm_settings(config)
 
@@ -129,6 +181,7 @@ async def run_task(
         llm=describe_llm(settings),
         max_steps=int(config["agent"]["max_steps"]),
         rag_mode=rag_mode or config["tools"]["rag"]["mode"],
+        thread_id=thread_id,
     )
 
     status = STATUS_ERROR
@@ -136,7 +189,11 @@ async def run_task(
     state: Dict[str, Any] = {}
     rag_mode_used = "none"
     metrics: Dict[str, Any] = {}
+    usage: Dict[str, Any] = {}
     executor: ToolExecutor | None = None
+    checkpoint_backend = "disabled"
+    resumed = False
+    steps_before = 0
 
     try:
         async with build_toolset(config, tracer, rag_mode) as toolset:
@@ -160,19 +217,50 @@ async def run_task(
                 )
 
             executor = ToolExecutor(toolset.tools, config, tracer, toolset.fallbacks)
-            llm = build_llm(settings)
-            graph = build_agent_graph(
-                llm, executor, tracer, config, memory_context=memory_context
-            )
 
-            state = await graph.ainvoke(
-                {
+            # ★ 断点续跑：只有指定了 thread_id 才挂 checkpointer（默认路径行为完全不变）
+            async with open_checkpointer(config, enabled=thread_id is not None) as (
+                checkpointer,
+                checkpoint_backend,
+                checkpoint_note,
+            ):
+                tracer.event(
+                    "checkpoint_ready",
+                    backend=checkpoint_backend,
+                    thread_id=thread_id,
+                    path=str(config["agent"].get("checkpoint", {}).get("path")),
+                    note=checkpoint_note,
+                )
+                llm = build_llm(settings)
+                graph = build_agent_graph(
+                    llm, executor, tracer, config, memory_context=memory_context,
+                    checkpointer=checkpointer,
+                )
+
+                invoke_config: Dict[str, Any] = {
+                    "recursion_limit": int(config["agent"]["recursion_limit"])
+                }
+                graph_input: Any = {
                     "messages": [HumanMessage(content=task)],
                     "steps": 0,
                     "status": "new",
-                },
-                config={"recursion_limit": int(config["agent"]["recursion_limit"])},
-            )
+                }
+
+                if checkpointer is not None:
+                    invoke_config["configurable"] = {"thread_id": thread_id}
+                    resumed, steps_before, has_history = await _detect_resume(
+                        graph, invoke_config, tracer, str(thread_id), resume
+                    )
+                    if resumed:
+                        # input=None：LangGraph 从最后一个 checkpoint 继续，只补跑未完成的节点
+                        graph_input = None
+                    elif has_history:
+                        # 上一轮已收尾，这次是同一 thread 上的新一轮：只追加消息，
+                        # **不要带 steps/status**（那会把通道值重置，步数统计就断了）
+                        graph_input = {"messages": [HumanMessage(content=task)]}
+
+                state = await graph.ainvoke(graph_input, config=invoke_config)
+
             status = str(state.get("status", STATUS_ERROR))
             if status == "in_progress":
                 # 图停下来但状态还是「进行中」= 被最大步数拦住了
@@ -202,14 +290,34 @@ async def run_task(
     elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
     metrics = _summarize_metrics(tracer, executor) if executor else {}
 
+    # token / 成本：从 trace 的 llm_call 事件聚合（纯函数，事后可对 trace 文件重算）
+    usage = summarize_usage(tracer.events, model=settings["model"], pricing=load_pricing(config))
+    total_steps = int(state.get("steps", 0))
+    steps_this_run = max(0, total_steps - steps_before)
+    metrics.update(
+        {
+            "usage": usage,
+            "thread_id": thread_id,
+            "checkpoint_backend": checkpoint_backend,
+            "resumed": resumed,
+            "steps_resumed_from": steps_before if resumed else 0,
+            "steps_this_run": steps_this_run,
+        }
+    )
+
     tracer.event(
         "run_end",
         status=status,
-        steps=int(state.get("steps", 0)),
+        steps=total_steps,
+        steps_this_run=steps_this_run,
         rag_mode=rag_mode_used,
         elapsed_ms=elapsed_ms,
         final_answer=final_answer,
         metrics=metrics,
+        thread_id=thread_id,
+        resumed=resumed,
+        resumed_from_step=(steps_before if resumed else 0),
+        checkpoint_backend=checkpoint_backend,
         trace_path=str(tracer.path),
         error=error,
     )
@@ -217,27 +325,42 @@ async def run_task(
     print(f"\n===== 最终回答（status={status}）=====")
     print(final_answer)
     print(
-        f"===== 指标：步数={state.get('steps', 0)} 工具调用={metrics.get('tool_calls')} "
+        f"===== 指标：步数={total_steps}（本次执行 {steps_this_run}）"
+        f" 工具调用={metrics.get('tool_calls')} "
         f"失败={metrics.get('tool_failed')} 重试={metrics.get('tool_retries')} "
         f"降级={metrics.get('tool_degraded')} 上下文压缩={metrics.get('context_saved_chars')}字符 "
         f"RAG形态={rag_mode_used} ====="
     )
+    print(format_usage_line(usage, extra=f" | 步数={total_steps} status={status}"))
+    if thread_id:
+        print(
+            f"===== 断点续跑：thread_id={thread_id} 后端={checkpoint_backend} "
+            f"本次是否续跑={'是（从第 %d 步后继续）' % steps_before if resumed else '否'} ====="
+        )
     print(f"===== trace：{tracer.path} =====")
 
     return RunResult(
         run_id=tracer.run_id,
         status=status,
-        steps=int(state.get("steps", 0)),
+        steps=total_steps,
         final_answer=final_answer,
         trace_path=str(tracer.path),
         elapsed_ms=elapsed_ms,
         rag_mode=rag_mode_used,
         metrics=metrics,
         error=error,
+        thread_id=thread_id,
+        resumed=resumed,
+        resumed_from_step=(steps_before if resumed else 0),
+        usage=usage,
     )
 
 
 def run_task_sync(task: str, config: Dict[str, Any] | None = None, rag_mode: str | None = None,
-                  console: str | None = None) -> RunResult:
+                  console: str | None = None, thread_id: str | None = None,
+                  resume: bool = False) -> RunResult:
     """同步包装（给不方便用 asyncio 的场景）。"""
-    return asyncio.run(run_task(task, config=config, rag_mode=rag_mode, console=console))
+    return asyncio.run(
+        run_task(task, config=config, rag_mode=rag_mode, console=console,
+                 thread_id=thread_id, resume=resume)
+    )

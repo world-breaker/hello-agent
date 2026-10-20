@@ -1,6 +1,6 @@
 # hello-agent 的 CI 门禁（通用 GitHub Actions 格式）。
 #
-# 宿主说明：本仓库当前托管在 **Gitee（私有仓库）**，Gitee 不会执行 GitHub Actions，
+# 宿主说明：本仓库当前托管在 **Gitee（公开仓库）**，Gitee 不会执行 GitHub Actions，
 # 所以本文件在 Gitee 侧只是"可执行的门禁声明"，镜像一份到 GitHub 即开即用
 # （Gitee Go 暂未接入，原因与做法见 README §7「CI 门禁」）。
 #

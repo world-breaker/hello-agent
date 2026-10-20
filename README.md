@@ -693,9 +693,9 @@ trace 里也能直接看出来（这就是「客观证据」而不是口头声�
 那套测试有自动化门禁：`ubuntu-latest` + Python 3.12 + `pip` 依赖缓存 + `pytest -q -rs`，
 job 级设了离线变量，**不需要密钥、也不会下载模型**。
 
-> **宿主如实说明**：本仓库托管在 **Gitee（私有）**，Gitee 不会执行 GitHub Actions，也还没接 Gitee Go。
+> **宿主如实说明**：本仓库托管在 **Gitee（公开仓库）**，Gitee 不会执行 GitHub Actions，也还没接 Gitee Go。
 > 这份 YAML 用的是**通用 GitHub Actions 格式**——镜像一份到 GitHub 即可直接生效，但在 Gitee 侧目前不是自动跑的流水线。
-> 因此 README 里**不放 CI 徽章**：私有/异源仓库的徽章只会 404。
+> 因此 README 里**不放 CI 徽章**：徽章指向 GitHub Actions，而本仓库的流水线在 Gitee 侧不会跑，徽章只会 404。
 
 为什么这样设环境变量（每条都对着一个真实坑，不是仪式感）：
 

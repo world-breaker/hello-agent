@@ -4,10 +4,15 @@
     .venv\\Scripts\\python.exe scripts\\eval_agent.py                  # 用 config 里的 rag 形态
     .venv\\Scripts\\python.exe scripts\\eval_agent.py --rag-mode direct  # 强制进程内直连
     .venv\\Scripts\\python.exe scripts\\eval_agent.py --eval-set data/eval_queries.json
+    .venv\\Scripts\\python.exe scripts\\eval_agent.py --categories multi_tool,retrieval_arithmetic
+    .venv\\Scripts\\python.exe scripts\\eval_agent.py --ids q01,q02 --limit 2
 
 前置：
     - 需要 .env 里配好 OpenAI 兼容端点（与 run.py 同套配置）；
     - 评测逻辑见 agent/eval_harness.py（纯函数，可离线单测）。
+
+筛选参数（--ids / --categories / --limit）只影响「跑哪几条」，
+不影响指标口径；筛出来的子集的分母会跟着变小，报告里每项都带 n 就是为了看这个。
 """
 
 import argparse
@@ -32,15 +37,38 @@ from agent.eval_harness import (  # noqa: E402
 from agent.runner import run_task  # noqa: E402
 
 
+def _filter_queries(
+    queries: list,
+    ids: str = "",
+    categories: str = "",
+    limit: int = 0,
+) -> list:
+    """按 id / 分类 / 条数筛评测集（纯函数，可单测）。"""
+    if ids:
+        wanted = {item.strip() for item in ids.split(",") if item.strip()}
+        queries = [q for q in queries if str(q.get("id")) in wanted]
+    if categories:
+        wanted_cats = {item.strip() for item in categories.split(",") if item.strip()}
+        queries = [q for q in queries if str(q.get("category")) in wanted_cats]
+    if limit and limit > 0:
+        queries = queries[:limit]
+    return queries
+
+
 async def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--rag-mode", choices=["auto", "mcp", "direct"], default=None)
     parser.add_argument("--eval-set", default=str(REPO_ROOT / "data" / "eval_queries.json"))
     parser.add_argument("--out", default=str(REPO_ROOT / "eval_results"))
+    # ---- 跑哪几条（默认全跑；筛选只影响子集，不改指标口径）----
+    parser.add_argument("--ids", default="", help="只跑这些 id（逗号分隔，如 q01,q02）")
+    parser.add_argument("--categories", default="", help="只跑这些分类（逗号分隔）")
+    parser.add_argument("--limit", type=int, default=0, help="最多跑前 N 条（0 = 不限）")
     args = parser.parse_args()
 
     config = load_config()
     queries = load_eval_set(args.eval_set)
+    queries = _filter_queries(queries, args.ids, args.categories, args.limit)
     print(f"评测集：{len(queries)} 条；RAG 形态：{args.rag_mode or config['tools']['rag']['mode']}")
 
     records: list[EvalRecord] = []

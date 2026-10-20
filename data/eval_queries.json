@@ -3,96 +3,450 @@
     "id": "q01",
     "category": "multi_tool",
     "task": "先查知识库：LoRA 的典型配置里 r 和 α（alpha）分别是多少？然后用计算器算一下 α/r 的值，最后告诉我现在的时间（精确到秒）。",
-    "expect_tools": ["search_knowledge", "calculator", "current_time"]
+    "expect_tools": ["search_knowledge", "calculator", "current_time"],
+    "expected_refusal": false,
+    "answer_must_contain": ["低秩|LoRA", "α/r", "2"],
+    "answer_must_not_contain": ["r=64", "α=64"]
   },
   {
     "id": "q02",
     "category": "retrieval_arithmetic",
     "task": "知识库里说 chunk_size 的典型取值范围是多少？如果我按这个范围的上限，对一篇 5000 字符的文档做固定窗口切分、overlap 取 50，大约会产生多少个 chunk？请给出计算过程。",
-    "expect_tools": ["search_knowledge", "calculator"]
+    "expect_tools": ["search_knowledge", "calculator"],
+    "expected_refusal": false,
+    "answer_must_contain": ["chunk_size|chunk", "1024"],
+    "answer_must_not_contain": ["2048"]
   },
   {
     "id": "q03",
     "category": "out_of_domain",
     "task": "知识库里有没有关于「武汉天气」的内容？如果没有，请直接说没有，不要编造。",
-    "expect_tools": ["search_knowledge"]
+    "expect_tools": ["search_knowledge"],
+    "expected_refusal": true,
+    "answer_must_contain": ["没有关于|查不到|未找到|没有相关内容|不知道|不涉及"],
+    "answer_must_not_contain": ["晴转多云", "25度"]
   },
   {
     "id": "q04",
     "category": "retrieval_only",
     "task": "用知识库里的内容解释一下 RAG 系统是怎么做检索优化的。",
-    "expect_tools": ["search_knowledge"]
+    "expect_tools": ["search_knowledge"],
+    "expected_refusal": false,
+    "answer_must_contain": ["chunk|切分", "余弦|归一化|overlap"],
+    "answer_must_not_contain": []
   },
   {
     "id": "q05",
     "category": "time_only",
     "task": "现在几点了？请告诉我精确的日期和时间。",
-    "expect_tools": ["current_time"]
+    "expect_tools": ["current_time"],
+    "expected_refusal": false,
+    "answer_must_contain": ["现在|时间|日期", ":|点"],
+    "answer_must_not_contain": []
   },
   {
     "id": "q06",
     "category": "calculator_only",
     "task": "帮我算一下 (1024 - 50) / (1024 - 50) 等于多少。",
-    "expect_tools": ["calculator"]
+    "expect_tools": ["calculator"],
+    "expected_refusal": false,
+    "answer_must_contain": ["1.0|= 1|=1|等于 1|等于1"],
+    "answer_must_not_contain": []
   },
   {
     "id": "q07",
     "category": "multi_tool",
     "task": "查一下知识库里 Transformer 的自注意力机制是怎么计算的，再算一下 2 的 10 次方，最后报一下当前时间。",
-    "expect_tools": ["search_knowledge", "calculator", "current_time"]
+    "expect_tools": ["search_knowledge", "calculator", "current_time"],
+    "expected_refusal": false,
+    "answer_must_contain": ["自注意力|softmax", "1024", "现在|时间|日期"],
+    "answer_must_not_contain": []
   },
   {
     "id": "q08",
     "category": "retrieval_arithmetic",
     "task": "知识库提到模型量化常见方法，请查出来，并算一下如果一段 2048 字符文本按 chunk_size=512、overlap=50 切分会有几个 chunk。",
-    "expect_tools": ["search_knowledge", "calculator"]
+    "expect_tools": ["search_knowledge", "calculator"],
+    "expected_refusal": false,
+    "answer_must_contain": ["量化|INT8|INT4", "chunk|块"],
+    "answer_must_not_contain": []
   },
   {
     "id": "q09",
     "category": "out_of_domain",
     "task": "知识库里讲没讲怎么做番茄炒蛋？如果没讲，请如实说没有，不要编。",
-    "expect_tools": ["search_knowledge"]
+    "expect_tools": ["search_knowledge"],
+    "expected_refusal": true,
+    "answer_must_contain": ["没有关于|查不到|未找到|没有相关内容|不知道|不涉及"],
+    "answer_must_not_contain": ["放盐", "翻炒"]
   },
   {
     "id": "q10",
     "category": "retrieval_only",
     "task": "基于知识库说明一下 LoRA 微调的原理和典型参数。",
-    "expect_tools": ["search_knowledge"]
+    "expect_tools": ["search_knowledge"],
+    "expected_refusal": false,
+    "answer_must_contain": ["低秩", "A和B|A 和 B|A、B|A/B"],
+    "answer_must_not_contain": ["r=64", "α=64"]
   },
   {
     "id": "q11",
     "category": "multi_tool",
     "task": "先检索知识库里关于 RAG 系统核心组件的内容，然后用计算器算 (5000-512)/(512-50)+1，最后告诉我现在的时间。",
-    "expect_tools": ["search_knowledge", "calculator", "current_time"]
+    "expect_tools": ["search_knowledge", "calculator", "current_time"],
+    "expected_refusal": false,
+    "answer_must_contain": ["chunk|切分", "现在|时间|日期"],
+    "answer_must_not_contain": []
   },
   {
     "id": "q12",
     "category": "retrieval_arithmetic",
     "task": "查知识库：embedding 模型用的是哪个？它的向量维度是多少？再算一下 512 的一半是多少。",
-    "expect_tools": ["search_knowledge", "calculator"]
+    "expect_tools": ["search_knowledge", "calculator"],
+    "expected_refusal": false,
+    "answer_must_contain": ["BGE|m3e|stella", "256"],
+    "answer_must_not_contain": []
   },
   {
     "id": "q13",
     "category": "time_only",
     "task": "请告诉我今天是星期几、现在几点。",
-    "expect_tools": ["current_time"]
+    "expect_tools": ["current_time"],
+    "expected_refusal": false,
+    "answer_must_contain": ["星期", "现在|时间|日期|:|点"],
+    "answer_must_not_contain": []
   },
   {
     "id": "q14",
     "category": "calculator_only",
     "task": "计算 16 除以 8 的结果。",
-    "expect_tools": ["calculator"]
+    "expect_tools": ["calculator"],
+    "expected_refusal": false,
+    "answer_must_contain": ["2"],
+    "answer_must_not_contain": []
   },
   {
     "id": "q15",
     "category": "out_of_domain",
     "task": "知识库里有 NBA 总决赛的比分吗？没有就直接说没有。",
-    "expect_tools": ["search_knowledge"]
+    "expect_tools": ["search_knowledge"],
+    "expected_refusal": true,
+    "answer_must_contain": ["没有关于|查不到|未找到|没有相关内容|不知道|不涉及"],
+    "answer_must_not_contain": ["114", "比分为"]
   },
   {
     "id": "q16",
     "category": "retrieval_only",
     "task": "用知识库内容讲讲大语言模型的微调技术主要有哪些。",
-    "expect_tools": ["search_knowledge"]
+    "expect_tools": ["search_knowledge"],
+    "expected_refusal": false,
+    "answer_must_contain": ["LoRA", "指令微调|Instruction|RLHF|DPO"],
+    "answer_must_not_contain": []
+  },
+  {
+    "id": "q17",
+    "category": "retrieval_only",
+    "task": "用知识库的内容说明一下 Transformer 的自注意力公式里每一步在做什么。",
+    "expect_tools": ["search_knowledge"],
+    "expected_refusal": false,
+    "answer_must_contain": ["softmax", "QK|√d"],
+    "answer_must_not_contain": []
+  },
+  {
+    "id": "q18",
+    "category": "retrieval_only",
+    "task": "知识库里的 LoRA 典型配置是什么？r 和 α 各是多少？可训练参数大概占总量的百分之多少？",
+    "expect_tools": ["search_knowledge"],
+    "expected_refusal": false,
+    "answer_must_contain": ["低秩", "0.3"],
+    "answer_must_not_contain": ["r=64", "α=64"]
+  },
+  {
+    "id": "q19",
+    "category": "retrieval_only",
+    "task": "按知识库的说法，全参数微调一个 7B 模型（FP16）大概要多少显存？需要几张什么卡？",
+    "expect_tools": ["search_knowledge"],
+    "expected_refusal": false,
+    "answer_must_contain": ["76", "A100"],
+    "answer_must_not_contain": ["24GB", "单张 24"]
+  },
+  {
+    "id": "q20",
+    "category": "retrieval_only",
+    "task": "知识库里提到的参数高效微调方法有哪些？QLoRA 和 Adapter 分别是怎么做的？",
+    "expect_tools": ["search_knowledge"],
+    "expected_refusal": false,
+    "answer_must_contain": ["4bit|4 位|四比特", "Adapter|适配器"],
+    "answer_must_not_contain": []
+  },
+  {
+    "id": "q21",
+    "category": "retrieval_only",
+    "task": "知识库里的指令微调、RLHF 和 DPO 分别是什么？DPO 相比 RLHF 少了一步什么？",
+    "expect_tools": ["search_knowledge"],
+    "expected_refusal": false,
+    "answer_must_contain": ["DPO", "PPO|奖励模型"],
+    "answer_must_not_contain": []
+  },
+  {
+    "id": "q22",
+    "category": "retrieval_only",
+    "task": "知识库里常见的模型量化方法有哪些？INT8 和 INT4 分别能把显存减少多少？",
+    "expect_tools": ["search_knowledge"],
+    "expected_refusal": false,
+    "answer_must_contain": ["INT8", "INT4"],
+    "answer_must_not_contain": ["精度无损|完全无损"]
+  },
+  {
+    "id": "q23",
+    "category": "retrieval_only",
+    "task": "知识库里的 NF4 是什么？量化时的 scale 是怎么算出来的？",
+    "expect_tools": ["search_knowledge"],
+    "expected_refusal": false,
+    "answer_must_contain": ["NF4", "max - min|max-min|15"],
+    "answer_must_not_contain": ["scale = max", "scale=max"]
+  },
+  {
+    "id": "q24",
+    "category": "retrieval_only",
+    "task": "知识库说大规模向量检索该用什么索引？换成它以后检索精度会损失多少？",
+    "expect_tools": ["search_knowledge"],
+    "expected_refusal": false,
+    "answer_must_contain": ["IVF", "PQ"],
+    "answer_must_not_contain": ["精度损失为 0|没有精度损失"]
+  },
+  {
+    "id": "q25",
+    "category": "retrieval_arithmetic",
+    "task": "知识库里对 chunk_size 和 overlap 怎么建议？如果用 chunk_size=512、overlap=50 去切一篇 20000 字符的文档，大约会得到多少个 chunk？",
+    "expect_tools": ["search_knowledge", "calculator"],
+    "expected_refusal": false,
+    "answer_must_contain": ["overlap", "43|43.18|44|45"],
+    "answer_must_not_contain": []
+  },
+  {
+    "id": "q26",
+    "category": "retrieval_arithmetic",
+    "task": "知识库里向量检索用什么相似度来衡量 query 和文档的相关性？再算一下一个 512 维 float32 向量大约占多少 KB？",
+    "expect_tools": ["search_knowledge", "calculator"],
+    "expected_refusal": false,
+    "answer_must_contain": ["余弦", "2 ?KB|2KB|2048"],
+    "answer_must_not_contain": []
+  },
+  {
+    "id": "q27",
+    "category": "retrieval_arithmetic",
+    "task": "查知识库里的量化计算公式：scale 是怎么算的？按 max=1.0、min=0.0 算一下 scale 等于多少？",
+    "expect_tools": ["search_knowledge", "calculator"],
+    "expected_refusal": false,
+    "answer_must_contain": ["15", "0.0667|0.0666|0.067"],
+    "answer_must_not_contain": []
+  },
+  {
+    "id": "q28",
+    "category": "retrieval_arithmetic",
+    "task": "查知识库里 LoRA 的公式和典型 r、α 的取值，然后算一下 α/r 等于多少。",
+    "expect_tools": ["search_knowledge", "calculator"],
+    "expected_refusal": false,
+    "answer_must_contain": ["低秩|LoRA", "2"],
+    "answer_must_not_contain": ["r=64", "α=64"]
+  },
+  {
+    "id": "q29",
+    "category": "retrieval_arithmetic",
+    "task": "知识库说 INT4 量化能把模型从 6GB 压到多少？帮我算一下这是压缩了多少倍。",
+    "expect_tools": ["search_knowledge", "calculator"],
+    "expected_refusal": false,
+    "answer_must_contain": ["1.5", "4"],
+    "answer_must_not_contain": []
+  },
+  {
+    "id": "q30",
+    "category": "calculator_only",
+    "task": "帮我算一下 (3 + 5) * 2 等于多少。",
+    "expect_tools": ["calculator"],
+    "expected_refusal": false,
+    "answer_must_contain": ["16"],
+    "answer_must_not_contain": []
+  },
+  {
+    "id": "q31",
+    "category": "calculator_only",
+    "task": "用计算器算一下 sqrt(16) + 2**10 等于多少。",
+    "expect_tools": ["calculator"],
+    "expected_refusal": false,
+    "answer_must_contain": ["1028"],
+    "answer_must_not_contain": ["1032", "1036"]
+  },
+  {
+    "id": "q32",
+    "category": "calculator_only",
+    "task": "计算 100 除以 7 的结果（保留两位小数）。",
+    "expect_tools": ["calculator"],
+    "expected_refusal": false,
+    "answer_must_contain": ["14.28|14.29"],
+    "answer_must_not_contain": []
+  },
+  {
+    "id": "q33",
+    "category": "time_only",
+    "task": "今天是几月几号？",
+    "expect_tools": ["current_time"],
+    "expected_refusal": false,
+    "answer_must_contain": ["月|日|-", ":|点|时"],
+    "answer_must_not_contain": []
+  },
+  {
+    "id": "q34",
+    "category": "time_only",
+    "task": "请告诉我当前的日期、时间和星期几。",
+    "expect_tools": ["current_time"],
+    "expected_refusal": false,
+    "answer_must_contain": ["星期", "月|日|-"],
+    "answer_must_not_contain": []
+  },
+  {
+    "id": "q35",
+    "category": "multi_tool",
+    "task": "先查知识库里常见的模型量化方法，再算一下 8bit 量化相对 16bit 的显存占用比例，最后报一下当前时间。",
+    "expect_tools": ["search_knowledge", "calculator", "current_time"],
+    "expected_refusal": false,
+    "answer_must_contain": ["INT8|INT4|量化", "现在|时间|日期"],
+    "answer_must_not_contain": []
+  },
+  {
+    "id": "q36",
+    "category": "multi_tool",
+    "task": "检索知识库里关于 LoRA 的说明，算一下 α/r 的值，然后告诉我现在几点。",
+    "expect_tools": ["search_knowledge", "calculator", "current_time"],
+    "expected_refusal": false,
+    "answer_must_contain": ["低秩|LoRA", "现在|时间|日期"],
+    "answer_must_not_contain": []
+  },
+  {
+    "id": "q37",
+    "category": "multi_tool",
+    "task": "查知识库确认 chunk_size 的典型范围，算一下 5120 字符按 chunk_size=512、overlap=50 切分会有多少个 chunk，再报一下当前时间。",
+    "expect_tools": ["search_knowledge", "calculator", "current_time"],
+    "expected_refusal": false,
+    "answer_must_contain": ["chunk", "现在|时间|日期"],
+    "answer_must_not_contain": []
+  },
+  {
+    "id": "q38",
+    "category": "clarification",
+    "task": "帮我优化一下这段文案。",
+    "expect_tools": [],
+    "expected_refusal": false,
+    "answer_must_contain": ["请提供|发给我|哪段|粘贴|补充|具体"],
+    "answer_must_not_contain": []
+  },
+  {
+    "id": "q39",
+    "category": "clarification",
+    "task": "把价格改成 200 元。",
+    "expect_tools": [],
+    "expected_refusal": false,
+    "answer_must_contain": ["哪个|哪种|哪一个|请说明|请提供|请确认"],
+    "answer_must_not_contain": []
+  },
+  {
+    "id": "q40",
+    "category": "clarification",
+    "task": "统计一下去年有多少用户。",
+    "expect_tools": [],
+    "expected_refusal": false,
+    "answer_must_contain": ["请说明|哪个|哪一年|请确认|具体|明确"],
+    "answer_must_not_contain": []
+  },
+  {
+    "id": "q41",
+    "category": "clarification",
+    "task": "按刚才说的方案继续做。",
+    "expect_tools": [],
+    "expected_refusal": false,
+    "answer_must_contain": ["上文|上下文|之前|请提供|发给我|具体"],
+    "answer_must_not_contain": []
+  },
+  {
+    "id": "q42",
+    "category": "tool_failure_recovery",
+    "task": "用计算器算一下 5 / 0，告诉我结果是多少。",
+    "expect_tools": ["calculator"],
+    "expected_refusal": true,
+    "answer_must_contain": ["除数为 0|无法计算|失败|错误"],
+    "answer_must_not_contain": ["无穷大|Infinity"]
+  },
+  {
+    "id": "q43",
+    "category": "tool_failure_recovery",
+    "task": "用计算器算一下 sqrt(-16) 的值。",
+    "expect_tools": ["calculator"],
+    "expected_refusal": true,
+    "answer_must_contain": ["无法|失败|错误|负数"],
+    "answer_must_not_contain": []
+  },
+  {
+    "id": "q44",
+    "category": "tool_failure_recovery",
+    "task": "先检索知识库里关于模型量化的内容，再用计算器算 1 / (2 - 2)。",
+    "expect_tools": ["search_knowledge", "calculator"],
+    "expected_refusal": true,
+    "answer_must_contain": ["量化|INT8|INT4", "除数为 0|无法计算|失败|错误"],
+    "answer_must_not_contain": []
+  },
+  {
+    "id": "q45",
+    "category": "tool_failure_recovery",
+    "task": "请用计算器算一下 12 ** * 3 这个表达式，并如实告诉我结果。",
+    "expect_tools": ["calculator"],
+    "expected_refusal": true,
+    "answer_must_contain": ["失败|错误|无法|语法"],
+    "answer_must_not_contain": ["36", "108"]
+  },
+  {
+    "id": "q46",
+    "category": "out_of_domain",
+    "task": "知识库里有今天北京股市的收盘价吗？没有就别猜。",
+    "expect_tools": ["search_knowledge"],
+    "expected_refusal": true,
+    "answer_must_contain": ["没有关于|查不到|未找到|没有相关内容|不知道|不涉及"],
+    "answer_must_not_contain": ["收盘价为", "点位"]
+  },
+  {
+    "id": "q47",
+    "category": "out_of_domain",
+    "task": "知识库里有《活着》的读书笔记吗？",
+    "expect_tools": ["search_knowledge"],
+    "expected_refusal": true,
+    "answer_must_contain": ["没有关于|查不到|未找到|没有相关内容|不知道|不涉及"],
+    "answer_must_not_contain": ["余华", "主人公", "福贵"]
+  },
+  {
+    "id": "q48",
+    "category": "out_of_domain",
+    "task": "知识库里有我的体检报告吗？",
+    "expect_tools": ["search_knowledge"],
+    "expected_refusal": true,
+    "answer_must_contain": ["没有关于|查不到|未找到|没有相关内容|不知道|不涉及"],
+    "answer_must_not_contain": ["血压", "血糖", "心率"]
+  },
+  {
+    "id": "q49",
+    "category": "out_of_domain",
+    "task": "知识库里有明天杭州的天气预报吗？",
+    "expect_tools": ["search_knowledge"],
+    "expected_refusal": true,
+    "answer_must_contain": ["没有关于|查不到|未找到|没有相关内容|不知道|不涉及"],
+    "answer_must_not_contain": ["晴转多云", "降水概率", "℃"]
+  },
+  {
+    "id": "q50",
+    "category": "out_of_domain",
+    "task": "知识库里有 DeepSeek-V4 的技术报告吗？",
+    "expect_tools": ["search_knowledge"],
+    "expected_refusal": true,
+    "answer_must_contain": ["没有关于|查不到|未找到|没有相关内容|不知道|不涉及"],
+    "answer_must_not_contain": ["参数量", "开源协议", "评测得分"]
   }
 ]

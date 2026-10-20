@@ -16,7 +16,8 @@
 
 | 项目 | 事实 | 证据位置 |
 |---|---|---|
-| 离线测试 | `95 passed / 1 skipped`（MCP 端到端测试用环境变量开启） | §7 |
+| 离线测试 | `116 passed / 1 skipped`（MCP 端到端测试用环境变量开启，全开为 `117 passed`） | §7 |
+| 评测集 | `data/eval_queries.json` **50 条**带 ground truth（工具期望 / 该不该拒答 / 答案要点 / 幻觉陷阱） | §5.9 |
 | 真实任务 | 三条 demo 全部 `status=completed`（步数 3 / 4 / 2，总耗时 30.97s） | §1 |
 | 最大步数 | `--max-steps 1` 稳定得到「未完成收尾」，不会假完成 | §1.3 |
 | 降级 | 把 MCP 命令改坏后，`auto` 模式如实降级到进程内直连并完成任务 | §1.4 |
@@ -618,18 +619,54 @@ trace 里也能直接看出来（这就是「客观证据」而不是口头声�
 
 ### 5.9 量化评测与指标口径（`agent/eval_harness.py`）
 
-`scripts/eval_agent.py` 跑 `data/eval_queries.json`（16 条，带 `category` 与 `expect_tools`），
+`scripts/eval_agent.py` 跑 `data/eval_queries.json`（**50 条**，每条带 ground truth 标注），
 把每次运行聚合成作品集级指标。**指标最容易骗人的地方不是算错，而是口径没说清**——
 所以每个指标都写死了「分母是谁」，并且把分子分母一起报出来。
+
+#### 5.9.0 评测集与 ground truth（50 条，8 个分类）
+
+评测集从 **16 条 smoke 级**扩到 **50 条**，每条都带可判定的 ground truth：
+
+| 字段 | 含义 | 取值约定 |
+|---|---|---|
+| `expect_tools` | 期望用到的工具（别名 `expected_tools` 也认） | **空列表 = 这一问不该用工具**（模型该直接答或该澄清）；与「没标注」是两回事 |
+| `expected_refusal` | 这一问模型**是否应当承认做不到 / 不知道** | 领域外问题**必须**为 `true`；工具失败应降级的题也为 `true` |
+| `answer_must_contain` | 答案里必须出现的要点（1~3 个） | 一项可用 `a\|b\|c` 写多个可接受写法（任一命中即算这条要点命中），容忍「查不到 / 没有相关内容 / 未找到」等措辞差异 |
+| `answer_must_not_contain` | 不该出现的词（抓幻觉） | 只放**断言形状**的词（如「收盘价为」「晴转多云」），不放会被原样复述的题面词 |
+
+分类与条数（`retrieval_only` 11 / `retrieval_arithmetic` 8 / `out_of_domain` 8 / `multi_tool` 6 /
+`calculator_only` 5 / `time_only` 4 / `clarification` 4 / `tool_failure_recovery` 4）：
+
+- **单工具**：`retrieval_only` / `calculator_only` / `time_only`；
+- **多工具**：`multi_tool`（检索 → 计算 → 取时间）、`retrieval_arithmetic`（先查再算）；
+- **领域外（该拒答）**：`out_of_domain`（8 条，`expected_refusal=true`）；
+- **需要计算 / 需要时间**：分别见 `retrieval_arithmetic` 与 `time_only`；
+- **模糊 / 多义（该澄清）**：`clarification`（4 条，`expect_tools: []`——**不该调工具**，该问清楚）；
+- **工具失败应降级**：`tool_failure_recovery`（4 条：除零、负数开方、语法错、检索成功但计算失败——
+  期望行为是**如实说失败**，不许编一个数）。
+
+> **向后兼容**：`data/eval_queries.json` 里原有 16 条的 `id / category / task / expect_tools`
+> **逐字未改**，只新增了三个标注字段；打分器对**没有**标注的老条目照常算，
+> 新指标只是「没有」（分母 0 → 报 `None`），不报错、不改变老指标的数值。
+> `expect_tools` 与 `expected_tools` 两个字段名都认（`expect_tools` 优先）。
 
 | 指标 | 口径（分母 = 谁） | 为什么这么定 |
 |---|---|---|
 | `completion_rate` | 全部运行 | — |
-| `tool_selection_accuracy` | 标了 `expect_tools` 的运行 | **期望工具 ⊆ 实际「成功执行过」的工具**（见 §5.9.1） |
+| `tool_selection_accuracy` | 标了非空 `expect_tools` 的运行 | **期望工具 ⊆ 实际「成功执行过」的工具**（见 §5.9.1） |
 | `tool_selection_attempt_rate` | 同上 | 期望工具 ⊆ **发起过**的工具（发起即算，不管有没有跑成功） |
+| `no_tool_violation_rate` | 显式标了 `expect_tools: []` 的运行 | 该不用工具却用了 = 违规（澄清类题目主要看这个） |
 | `failure_recovery_rate` | 发生过重试/降级的运行 | 其中最终 `completed` 的占比 |
 | `out_of_domain_honesty_rate` | **领域外且 `status=completed` 的运行** | 见 §5.9.1 |
+| `refusal_accuracy` | **标了 `expected_refusal=true` 且 `status=completed` 的运行** | 该承认做不到时承认了没有（见 §5.9.3） |
+| `refusal_false_positive_rate` | **未标 `expected_refusal` 且 `status=completed` 的运行** | 反向检查：该答却拒答（词表启发式，见 §5.9.4） |
+| `answer_keyword_recall` | **标了 `answer_must_contain` 且 `status=completed` 的运行** | 命中要点数 / 要点总数（见 §5.9.3） |
+| `answer_keyword_full_hit_rate` | 同上 | 要点**全中**的运行占比（比加权 recall 更严） |
+| `hallucination_rate` | **标了 `answer_must_not_contain` 且 `status=completed` 的运行** | 命中「不该出现」词的运行占比（抓幻觉） |
 | `total_tokens` / `total_cost_usd` | 全部运行（成本只算命中单价表的） | 见 §5.7 |
+
+> **每个比率旁边都有它的分母**（`*_n` 字段，`render_markdown` 也会一起打出来）：
+> 分母是 0 时比率报 `None`（“算不出来”），**不报 0**——否则「一条都没跑成」会被读成「准确率 0%」。
 
 #### 5.9.1 领域外诚实率：只统计**真正完成**的运行
 
@@ -676,6 +713,45 @@ trace 里也能直接看出来（这就是「客观证据」而不是口头声�
 > 口径写在代码里也写在文档里：`EvalRecord.used_tools`（发起过）、
 > `EvalRecord.used_tools_ok`（成功执行过），由 `extract_tool_names` /
 > `extract_successful_tool_names` 从 trace 重算——**已有 trace 不用重跑也能换口径重算**。
+
+#### 5.9.3 ground truth 打分：拒答准确率 / 答案要点命中率 / 幻觉率
+
+只看「跑完了没有」「工具选对没有」还不够——**答得对不对**也要判。三个新指标都基于评测集里的
+ground truth 标注，口径与诚实率**完全一致**（分母只算 `status=completed` 的运行）：
+
+| 指标 | 判定 | 分母字段 |
+|---|---|---|
+| `refusal_accuracy` | 标了 `expected_refusal=true` 的运行里，**回答来自模型**且带拒答措辞（「查不到 / 没有相关内容 / 失败…」）的占比 | `refusal_accuracy_n` |
+| `refusal_false_positive_rate` | **没标** `expected_refusal` 的运行里，却出现了拒答措辞的占比（该答却拒答） | `refusal_false_positive_n` |
+| `answer_keyword_recall` | 命中要点数 / 要点总数（按要点加权，不是按题目加权） | `answer_keyword_recall_n`（被打分的运行数） |
+| `answer_keyword_full_hit_rate` | 要点**全中**的运行占比（比加权 recall 更严） | `answer_keyword_full_hit_n` |
+| `hallucination_rate` | 命中 `answer_must_not_contain` 里「不该出现」的词的运行占比 | `hallucination_n` |
+
+三处口径细节（都是踩过的坑）：
+
+1. **分子看回答来源，分母只看状态**：`final_answer_source != "model"` 的回答（模型调用失败时的系统兜底文案）
+   **不进分子**——它里面写着「这一步没有产生任何工具调用」，「没有」正好命中拒答词表，
+   不区分的话一次都没答出来的运行会被算成「诚实拒答」（和 §5.9.1 同一个假绿坑）。
+2. **失败运行既不进分子也不进分母**：口径与诚实率统一，避免「跑挂了」被算成「答得差」。
+3. **拒答词表与诚实词表是两份**：`out_of_domain_honesty_rate` 用的是老词表（含裸「没有」），
+   `refusal_accuracy` 用的是更严的新词表——因为「检索成功但片段没提到某个细节」的成功回答里
+   也常有「没有」，共用宽松词表会把成功回答误判成拒答（false positive 变假红）。
+
+打分器本身是**纯函数**（`score_answer(query, answer)`），离线可单测：
+`tests/test_eval_scoring.py` 覆盖严/宽口径、拒答只算完成、关键词命中、空答案、幻觉率、
+老结构条目兼容、两个字段名别名等 **21 条**。
+
+#### 5.9.4 这套打分的局限（不吹）
+
+- **拒答与幻觉判定都是关键词启发式**，不是语义判定：「无法确认具体数值」这类措辞会被算成拒答（假阳性）；
+  `answer_must_not_contain` 若写进会被原样复述的题面词，也会误报幻觉。
+  所以 ground truth 的禁词只放**断言形状**的词，且指标永远连着分母一起看。
+- **要点命中率是「关键词在不在」，不是「说得对不对」**：同义改写会漏判，
+  因此要点允许写多个可接受写法（`a|b|c`），但仍挡不住换一种说法的正确回答。
+- **数值类要点容易因公式口径不同而误判**（如 chunk 数按哪种公式算），
+  这类要点一律写成多个可接受值的并集。
+- **50 条仍是小样本**：覆盖的是本项目这 5 类工具与 1 个知识库的分布，不代表线上分布；
+  它的作用是**回归护栏**（改动前后同口径对比），不是能力上限的度量。
 
 ---
 
@@ -725,7 +801,7 @@ trace 里也能直接看出来（这就是「客观证据」而不是口头声�
 ```text
 > .venv\Scripts\python.exe -m pytest -q
 ........................................................................s......................          [100%]
-95 passed, 1 skipped in 17.32s
+116 passed, 1 skipped in 24.63s
 ```
 
 把 MCP 端到端用例也打开（它会拉起 rag-mcp-server 子进程并加载 BGE 模型，约 10s）：
@@ -734,12 +810,12 @@ trace 里也能直接看出来（这就是「客观证据」而不是口头声�
 > set HELLO_AGENT_TEST_MCP=1
 > .venv\Scripts\python.exe -m pytest -q
 ........................................................................ [ 75%]
-........................                                                 [100%]
-96 passed in 37.17s
+.............................................                            [100%]
+117 passed in 28.59s
 
 > .venv\Scripts\python.exe -m pytest -q -k mcp_form     # 只跑那一条
 .                                                                        [100%]
-1 passed, 95 deselected in 13.61s
+1 passed, 116 deselected in 16.32s
 ```
 
 **测试怎么测一个「概率性系统」**：把模型替换成**脚本化假模型** `tests/fake_llm.py`
@@ -783,9 +859,10 @@ python -m pip install -r requirements.txt && python -m pytest -q -rs
 ```
 
 ```text
-# 本机（存在兄弟仓库 rag-mcp-server + BGE 缓存）：95 passed, 1 skipped in 17.32s
-# runner 上不存在兄弟仓库（= GitHub runner 的真实情形）：92 passed, 4 skipped in 3.87s
-#   —— 4 个集成用例走测试自带的 skipif 显式跳过（不是失败），见 tests/test_rag_tool.py
+# 本机（存在兄弟仓库 rag-mcp-server + BGE 缓存）：116 passed, 1 skipped in 24.63s
+# 本机 + HELLO_AGENT_TEST_MCP=1（把 MCP 端到端也打开）：117 passed in 28.59s
+# runner 上不存在兄弟仓库（= GitHub runner 的真实情形）：112 passed, 5 skipped in 4.02s
+#   —— 5 个集成用例走测试自带的 skipif 显式跳过（不是失败），见 tests/test_rag_tool.py
 ```
 
 ---
@@ -866,8 +943,8 @@ hello-agent/
 │   ├── usage_report.py        # 扫 trace 汇总 token / 成本（单次 + 累计，可导出 json/md）
 │   └── eval_agent.py          # 批量评测 CLI（落 eval_results/*.json + *.md）
 ├── data/
-│   └── eval_queries.json      # 16 条评测 query（含分类与期望工具）
-├── tests/                     # 95 passed / 1 skipped（+35：用量成本 13 + 断点续跑 8 + 评测口径 12 + 小修 2；MCP 端到端需设环境变量）
+│   └── eval_queries.json      # 50 条评测 query（分类 + 期望工具 + 该不该拒答 + 答案要点 + 幻觉陷阱）
+├── tests/                     # 116 passed / 1 skipped（+21：评测打分口径 21；MCP 端到端需设环境变量）
 │                              #   checkpoint / 演示产物落 data/ 已 gitignore
 ├── traces/                    # 真实运行 trace（JSONL，可回放）
 └── docs/
@@ -889,14 +966,16 @@ hello-agent/
   端点不返回 usage 时只能记「无用量」，不猜；
 - **本机没有 `.env`/密钥**，所以 §5.7 / §5.8 里的 token 与成本实测数字来自脚本化假模型
   （确定性、可复现），真实端点的端到端跑批留给有 key 的环境；
-- 评测集 16 条，规模小，指标只用于回归参考，不代表线上分布；
+- 评测集 **50 条**（原 16 条），覆盖 8 个分类与 4 类工具，规模仍然小，
+  指标用于**回归护栏**，不代表线上分布；拒答/幻觉判定是**关键词启发式**，有假阳性（详见 §5.9.4）；
 - 每任务新建 MCP 会话，子进程启动 + 预热约 5s 未优化。
 
 **下一步（按优先级）**
 1. 记忆召回升级为语义/混合检索（复用 rag-eval-platform 的向量 + RRF），并加 TTL / 去重；
 2. 上下文压缩升级为 LLM 摘要（当前是确定性的占位压缩，保证离线可复现）；
 3. MCP 会话复用 / 常驻进程，消除每任务 5s 的启动成本；
-4. 评测集扩到 50+ 条，按类别看指标（工具选择 / 失败恢复 / 领域外诚实）+ 成本，而不只看总体；
+4. 评测集继续扩（50 → 100+），并把分类别的指标（工具选择 / 失败恢复 / 领域外诚实 / 要点命中率）
+   与成本一起看，而不只看总体；关键词打分换成语义判分（LLM-as-Judge，与 rag-eval-platform 那套对齐）；
 5. 续跑再接一层「工具幂等键」（副作用去重），把 checkpoint 从「状态一致」推到「副作用一致」。
 
 ---

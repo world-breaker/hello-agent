@@ -151,6 +151,7 @@ async def run_task(
     console: str | None = None,
     thread_id: str | None = None,
     resume: bool = False,
+    llm: Any | None = None,
 ) -> RunResult:
     """跑一条任务，返回结构化结果（trace 落在 traces/ 下）。
 
@@ -159,11 +160,13 @@ async def run_task(
         input 传 None 让 LangGraph 只补跑未完成的节点 → 已完成的工具调用不会被重放。
     resume：把「续跑」这件事显式化（CLI `--resume`）。即使不加，只要检测到未完成状态也会续跑，
         因为这个参数只影响「没有可续跑状态时」的提示行为，不影响正常任务。
+    llm：**注入一个已构造好的模型**（离线实验 / 单测用）。传了就跳过「必须配好端点」的检查，
+        trace 里会记 `injected=<类名>` 而不是伪装成真实端点；不传时行为与之前完全一致。
     """
     config = config or load_config()
     settings = get_llm_settings(config)
 
-    if settings["missing"]:
+    if settings["missing"] and llm is None:
         raise RuntimeError(
             "缺少 LLM 端点配置："
             + ", ".join(settings["missing"])
@@ -182,7 +185,8 @@ async def run_task(
     tracer.event(
         "run_start",
         task=task,
-        llm=describe_llm(settings),
+        llm=(describe_llm(settings) if llm is None
+             else f"injected={type(llm).__name__} model={settings['model'] or 'n/a'} api_key=sk-****"),
         max_steps=int(config["agent"]["max_steps"]),
         rag_mode=rag_mode or config["tools"]["rag"]["mode"],
         thread_id=thread_id,
@@ -235,7 +239,7 @@ async def run_task(
                     path=str(config["agent"].get("checkpoint", {}).get("path")),
                     note=checkpoint_note,
                 )
-                llm = build_llm(settings)
+                llm = build_llm(settings) if llm is None else llm
                 graph = build_agent_graph(
                     llm, executor, tracer, config, memory_context=memory_context,
                     checkpointer=checkpointer,
@@ -371,9 +375,9 @@ async def run_task(
 
 def run_task_sync(task: str, config: Dict[str, Any] | None = None, rag_mode: str | None = None,
                   console: str | None = None, thread_id: str | None = None,
-                  resume: bool = False) -> RunResult:
+                  resume: bool = False, llm: Any | None = None) -> RunResult:
     """同步包装（给不方便用 asyncio 的场景）。"""
     return asyncio.run(
         run_task(task, config=config, rag_mode=rag_mode, console=console,
-                 thread_id=thread_id, resume=resume)
+                 thread_id=thread_id, resume=resume, llm=llm)
     )

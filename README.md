@@ -729,13 +729,13 @@ trace 里也能直接看出来（这就是「客观证据」而不是口头声�
 ```text
 > set HELLO_AGENT_TEST_MCP=1
 > .venv\Scripts\python.exe -m pytest -q
-........................................................................ [ 87%]
-..........                                                               [100%]
-82 passed in 28.63s
+........................................................................ [ 75%]
+........................                                                 [100%]
+96 passed in 37.17s
 
 > .venv\Scripts\python.exe -m pytest -q -k mcp_form     # 只跑那一条
 .                                                                        [100%]
-1 passed, 81 deselected in 13.58s
+1 passed, 95 deselected in 13.61s
 ```
 
 **测试怎么测一个「概率性系统」**：把模型替换成**脚本化假模型** `tests/fake_llm.py`

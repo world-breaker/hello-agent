@@ -100,6 +100,44 @@ def test_max_steps_exceeded_status_and_explanation(monkeypatch, tmp_path):
     assert events[-1]["status"] == STATUS_MAX_STEPS
 
 
+# ---------------- 最终回答的来源标记（诚实率假绿修复的最后一环）----------------
+
+
+class _BrokenLLM(ScriptedChatModel):
+    async def _agenerate(self, *args, **kwargs):
+        raise RuntimeError("模型炸了")
+
+
+def test_llm_error_answer_is_reported_as_system_fallback(monkeypatch, tmp_path):
+    """模型调用失败 → status=llm_error，且 final_answer_source=system_fallback（不是模型回答）。"""
+    config = patch_env(monkeypatch, tmp_path, [])
+    monkeypatch.setattr("agent.runner.build_llm", lambda settings: _BrokenLLM(responses=[]))
+
+    result = asyncio.run(run_task("随便问点什么", config=config))
+
+    assert result.status == "llm_error"
+    assert result.final_answer_source == "system_fallback"
+    assert "模型调用失败" in result.final_answer
+    events = read_events(Path(result.trace_path))
+    assert events[-1]["answer_source"] == "system_fallback"
+
+
+def test_completed_answer_is_reported_as_model(monkeypatch, tmp_path):
+    """正常完成 → final_answer_source=model。"""
+    config = patch_env(
+        monkeypatch, tmp_path,
+        [
+            tool_call("calculator", {"expression": "6*7"}, "call_1"),
+            AIMessage(content="6*7=42。"),
+        ],
+    )
+
+    result = asyncio.run(run_task("算一下 6*7", config=config))
+
+    assert result.status == STATUS_COMPLETED
+    assert result.final_answer_source == "model"
+
+
 def test_missing_env_raises_readable_error(monkeypatch, tmp_path):
     for name in ("OPENAI_BASE_URL", "OPENAI_API_KEY", "MODEL"):
         monkeypatch.delenv(name, raising=False)

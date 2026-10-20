@@ -64,6 +64,8 @@ async def main() -> int:
                 tool_success_rate=m.get("tool_success_rate"),
                 used_tools=used,
                 final_answer=res.final_answer,
+                # 回答来源：区分「模型真实回答」与「系统兜底文案」，评测侧据此算诚实率
+                final_answer_source=res.final_answer_source,
                 prompt_tokens=usage.get("prompt_tokens", 0),
                 completion_tokens=usage.get("completion_tokens", 0),
                 total_tokens=usage.get("total_tokens", 0),

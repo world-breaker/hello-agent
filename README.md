@@ -12,7 +12,7 @@
 
 | 项目 | 事实 | 证据位置 |
 |---|---|---|
-| 离线测试 | `81 passed / 1 skipped`（MCP 端到端测试用环境变量开启） | §7 |
+| 离线测试 | `89 passed / 1 skipped`（MCP 端到端测试用环境变量开启） | §7 |
 | 真实任务 | 三条 demo 全部 `status=completed`（步数 3 / 4 / 2，总耗时 30.97s） | §1 |
 | 最大步数 | `--max-steps 1` 稳定得到「未完成收尾」，不会假完成 | §1.3 |
 | 降级 | 把 MCP 命令改坏后，`auto` 模式如实降级到进程内直连并完成任务 | §1.4 |
@@ -610,6 +610,51 @@ trace 里也能直接看出来（这就是「客观证据」而不是口头声�
 
 ---
 
+### 5.9 量化评测与指标口径（`agent/eval_harness.py`）
+
+`scripts/eval_agent.py` 跑 `data/eval_queries.json`（16 条，带 `category` 与 `expect_tools`），
+把每次运行聚合成作品集级指标。**指标最容易骗人的地方不是算错，而是口径没说清**——
+所以每个指标都写死了「分母是谁」，并且把分子分母一起报出来。
+
+| 指标 | 口径（分母 = 谁） | 为什么这么定 |
+|---|---|---|
+| `completion_rate` | 全部运行 | — |
+| `tool_selection_accuracy` | 标了 `expect_tools` 的运行 | **期望工具 ⊆ 实际「成功执行过」的工具**（见 §5.9.1） |
+| `tool_selection_attempt_rate` | 同上 | 期望工具 ⊆ **发起过**的工具（发起即算，不管有没有跑成功） |
+| `failure_recovery_rate` | 发生过重试/降级的运行 | 其中最终 `completed` 的占比 |
+| `out_of_domain_honesty_rate` | **领域外且 `status=completed` 的运行** | 见 §5.9.1 |
+| `total_tokens` / `total_cost_usd` | 全部运行（成本只算命中单价表的） | 见 §5.7 |
+
+#### 5.9.1 领域外诚实率：只统计**真正完成**的运行
+
+领域外问题（知识库里没有）最能看出 Agent 是否会编造，所以单独算一个「诚实率」。
+第一版实现只看回答里有没有否认词（「没有 / 查不到 / 无法回答…」），**不看运行状态**——
+于是踩了一个典型的「假绿」坑：
+
+```text
+模型调用失败 → graph 的兜底文案：
+  [模型调用失败] RuntimeError: …（已按配置重试 llm.max_retries 次；这一步没有产生任何工具调用）
+                                      ↑「没有」命中否认词 → 被算成「诚实拒答」
+```
+
+一次都没答出来的失败运行，就这么把诚实率撑到了 1.0。**现在口径改成**：
+
+1. 诚实率**只统计 `status == "completed"`** 的样本（失败运行既不进分子也不进分母）；
+2. 同时给出 `out_of_domain_completed_n`（领域外真正完成的条数）与 `out_of_domain_n`（领域外总条数），
+   让分母在报告里**看得见**（`render_markdown` 会把这两个数一起打出来）；
+3. 回答来源也分开记：模型调用失败时，graph 给兜底文案打了 `answer_source="system_fallback"` 标记，
+   runner 把它透传成 `RunResult.final_answer_source` → 评测侧知道这条**不是模型真实回答**。
+
+> 失败时如实说明「[模型调用失败]」这个行为**没有改**——那正是系统该做的诚实；
+> 要改的只是「别把它当成一次诚实拒答来计数」。
+
+```text
+# 报告里长这样（完成 1 / 领域外共 3 条 → 诚实率 1.0，但分母是 1 不是 3）
+- 领域外诚实率（只统计真正完成的运行）：**1.0**（完成 **1** / 领域外共 **3** 条）
+```
+
+---
+
 ## 6. 结构化 trace
 
 一次任务一个文件：`traces/run_<yyyymmdd-HHMMSS>_<8位run_id>.jsonl`，**一行一个 JSON 事件**，
@@ -656,7 +701,7 @@ trace 里也能直接看出来（这就是「客观证据」而不是口头声�
 ```text
 > .venv\Scripts\python.exe -m pytest -q
 ........................................................................s......................          [100%]
-81 passed, 1 skipped in 10.84s
+89 passed, 1 skipped in 13.64s
 ```
 
 把 MCP 端到端用例也打开（它会拉起 rag-mcp-server 子进程并加载 BGE 模型，约 10s）：
@@ -712,8 +757,8 @@ python -m pip install -r requirements.txt && python -m pytest -q -rs
 ```
 
 ```text
-# 本机（存在兄弟仓库 rag-mcp-server + BGE 缓存）：81 passed, 1 skipped in 12.34s
-# runner 上不存在兄弟仓库（= GitHub runner 的真实情形）：78 passed, 4 skipped in 3.87s
+# 本机（存在兄弟仓库 rag-mcp-server + BGE 缓存）：89 passed, 1 skipped in 13.64s
+# runner 上不存在兄弟仓库（= GitHub runner 的真实情形）：86 passed, 4 skipped in 3.87s
 #   —— 4 个集成用例走测试自带的 skipif 显式跳过（不是失败），见 tests/test_rag_tool.py
 ```
 
@@ -742,6 +787,14 @@ python -m pip install -r requirements.txt && python -m pytest -q -rs
 5. **成本取舍要写清楚**：每个任务新建一个 MCP 会话 → 每次都重启子进程并预热索引（≈5s）。
    好处是进程隔离 + 会话干净；要省这 5s 就得让 Agent 常驻（或把 Server 常驻成共享进程）——
    本项目选了「简单 + 隔离」，并把成本如实写进文档（见 `toolset` 事件的 `connect_ms`）。
+6. **「领域外诚实率」假绿：把失败的运行算成了诚实拒答**。
+   诚实率原本只扫回答里有没有否认词（「没有 / 查不到…」），**不看运行状态**；
+   而模型调用失败时 graph 的兜底文案正好写着「这一步**没有**产生任何工具调用」→
+   命中否认词 → **一次都没答出来的运行被计成「诚实拒答」**，诚实率直接 1.0。
+   **识别信号：指标漂亮得不像话（1.0），去翻对应的那几条运行——它根本没答。**
+   修复：诚实率只统计 `status=completed` 的样本，并同时报出 `out_of_domain_completed_n`
+   与 `out_of_domain_n`（分母可见）；兜底文案另打 `answer_source="system_fallback"` 标记，
+   与「模型真实回答」区分开（详见 §5.9.1）。
 
 ---
 
@@ -788,7 +841,7 @@ hello-agent/
 │   └── eval_agent.py          # 批量评测 CLI（落 eval_results/*.json + *.md）
 ├── data/
 │   └── eval_queries.json      # 16 条评测 query（含分类与期望工具）
-├── tests/                     # 81 passed / 1 skipped（+21：用量成本 13 + 断点续跑 8；MCP 端到端需设环境变量）
+├── tests/                     # 89 passed / 1 skipped（+29：用量成本 13 + 断点续跑 8 + 评测口径 8；MCP 端到端需设环境变量）
 │                              #   checkpoint / 演示产物落 data/ 已 gitignore
 ├── traces/                    # 真实运行 trace（JSONL，可回放）
 └── docs/

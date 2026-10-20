@@ -29,7 +29,14 @@ def make_broken_tool(calls: dict):
     return StructuredTool.from_function(coroutine=_arun, name="broken", description="永远失败的工具")
 
 
-def build_env(tmp_path, responses, max_steps=3, tools=None):
+class BrokenLLM(ScriptedChatModel):
+    """总是抛异常的模型：用来验证 LLM 失败时的兜底路径。"""
+
+    async def _agenerate(self, *args, **kwargs):
+        raise RuntimeError("模型炸了")
+
+
+def build_env(tmp_path, responses, max_steps=3, tools=None, llm=None):
     config = load_config()
     config["agent"]["max_steps"] = max_steps
     config["tools"]["retry"]["backoff_base_s"] = 0.01   # 测试里不要真等
@@ -38,7 +45,8 @@ def build_env(tmp_path, responses, max_steps=3, tools=None):
     tracer = Tracer(tmp_path, console="quiet", run_id="graphtest")
     tool_map = tools if tools is not None else {"calculator": calculator}
     executor = ToolExecutor(tool_map, config, tracer)
-    llm = ScriptedChatModel(responses=responses)
+    if llm is None:
+        llm = ScriptedChatModel(responses=responses)
     graph = build_agent_graph(llm, executor, tracer, config)
     return graph, executor, tracer
 
@@ -151,6 +159,27 @@ def test_unknown_tool_does_not_break_the_loop(tmp_path):
     assert "没有名为 `weather_api` 的工具" in observations[0].content
     assert executor.stats["failed"] == 1
     assert executor.stats["calls"] == 1
+
+
+# ---------------- LLM 失败时的兜底 ----------------
+
+
+def test_llm_failure_fallback_is_marked_as_system_fallback(tmp_path):
+    """★ 模型调用失败时的兜底文案必须与「模型真实回答」区分开。
+
+    兜底文案里写着「……这一步没有产生任何工具调用」，「没有」正好命中评测侧的否认词 →
+    不打标记的话，一次都没答出来的失败运行会被算成「诚实拒答」（诚实率假绿）。
+    同时：**失败时如实说明「模型调用失败」的行为不能变**。
+    """
+    graph, executor, tracer = build_env(tmp_path, [], llm=BrokenLLM())
+
+    state = invoke(graph)
+
+    assert state["status"] == "llm_error"
+    last = state["messages"][-1]
+    assert (getattr(last, "additional_kwargs", None) or {}).get("answer_source") == "system_fallback"
+    assert "模型调用失败" in last.content          # 诚实行为保持不变
+    assert "没有产生任何工具调用" in last.content  # 兜底文案本身也不改
 
 
 def test_circuit_breaker_disables_repeatedly_failing_tool(tmp_path):

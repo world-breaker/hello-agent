@@ -35,6 +35,10 @@ class RunResult:
     rag_mode: str
     metrics: Dict[str, Any] = field(default_factory=dict)
     error: str | None = None
+    # 最终回答的来源：model（模型真实回答）| system_fallback（模型调用失败的系统兜底文案）
+    # | max_steps_explanation（步数用尽的收尾说明）| run_error（异常收尾）
+    # 评测侧靠它把「系统兜底」和「模型真实回答」区分开（见 agent/eval_harness.py）。
+    final_answer_source: str = "model"
     # 断点续跑相关（不指定 thread_id 时 thread_id=None / resumed=False）
     thread_id: str | None = None
     resumed: bool = False
@@ -280,12 +284,19 @@ async def run_task(
     # ---------- 收尾 ----------
     messages: List[AnyMessage] = state.get("messages") or []
     last_ai = next((m for m in reversed(messages) if isinstance(m, AIMessage)), None)
+    final_answer_source = "model"
     if status == STATUS_MAX_STEPS:
         final_answer = _failure_explanation(state, int(config["agent"]["max_steps"]))
+        final_answer_source = "max_steps_explanation"
     elif last_ai is not None:
         final_answer = _text_of(last_ai).strip()
+        # 模型调用失败时 graph 给兜底文案打了 answer_source 标记 → 这里原样传出去，
+        # 让评测侧知道这条不是「模型真实回答」（否则失败运行会被算成诚实拒答）。
+        source = (getattr(last_ai, "additional_kwargs", None) or {}).get("answer_source")
+        final_answer_source = str(source) if source else "model"
     else:
         final_answer = error or "（没有产生任何回答）"
+        final_answer_source = "run_error"
 
     elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
     metrics = _summarize_metrics(tracer, executor) if executor else {}
@@ -320,6 +331,7 @@ async def run_task(
         checkpoint_backend=checkpoint_backend,
         trace_path=str(tracer.path),
         error=error,
+        answer_source=final_answer_source,
     )
 
     print(f"\n===== 最终回答（status={status}）=====")
@@ -349,6 +361,7 @@ async def run_task(
         rag_mode=rag_mode_used,
         metrics=metrics,
         error=error,
+        final_answer_source=final_answer_source,
         thread_id=thread_id,
         resumed=resumed,
         resumed_from_step=(steps_before if resumed else 0),

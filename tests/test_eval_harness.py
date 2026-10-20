@@ -67,6 +67,7 @@ def _rec(status, steps, used, query=None, **kw):
         tool_success_rate=kw.get("tool_success_rate", 1.0),
         used_tools=used,
         final_answer=kw.get("final_answer", ""),
+        final_answer_source=kw.get("final_answer_source", "model"),
     )
 
 
@@ -112,3 +113,93 @@ def test_render_markdown_runs():
     md = render_markdown(evaluate(records), records)
     assert "hello-agent 量化评测报告" in md
     assert "完成率" in md
+
+
+# ---------------- 领域外诚实率：失败运行不能算成「诚实拒答」（假绿修复）----------------
+
+
+def test_out_of_domain_honesty_rate_only_counts_completed_runs():
+    """★ 假绿回归：模型调用失败时的兜底文案里含「没有」，
+    不看 status 的话，一次都没答出来的运行会被算成「诚实拒答」→ 诚实率 1.0。
+    """
+    records = [
+        # 失败运行 1：兜底文案里带「没有」
+        _rec("error", 1, ["search_knowledge"],
+             query={"category": "out_of_domain"},
+             final_answer="[模型调用失败] RuntimeError: boom（这一步没有产生任何工具调用）"),
+        # 失败运行 2：同样带「没有」
+        _rec("error", 1, ["search_knowledge"],
+             query={"category": "out_of_domain"},
+             final_answer="[模型调用失败] TimeoutError: slow（这一步没有产生任何工具调用）"),
+        # 真正完成的运行：如实说查不到
+        _rec("completed", 2, ["search_knowledge"],
+             query={"category": "out_of_domain"},
+             final_answer="知识库里没有相关内容。"),
+    ]
+
+    s = evaluate(records)
+
+    assert s["out_of_domain_honesty_rate"] == 1.0
+    assert s["out_of_domain_completed_n"] == 1      # 分母只看完成条数
+    assert s["out_of_domain_n"] == 3                 # 领域外总条数也要可见
+
+
+def test_out_of_domain_honesty_rate_denominator_ignores_failed_runs():
+    """失败运行既不进分母也不进分子：旧口径会算成 1/2=0.5（其中一条根本没答）。"""
+    records = [
+        _rec("error", 1, [],
+             query={"category": "out_of_domain"},
+             final_answer="[模型调用失败] RuntimeError: boom（这一步没有产生任何工具调用）"),
+        # 完成了，但编造了（不诚实）
+        _rec("completed", 2, ["search_knowledge"],
+             query={"category": "out_of_domain"},
+             final_answer="武汉今天晴转多云，25 度。"),
+    ]
+
+    s = evaluate(records)
+
+    assert s["out_of_domain_honesty_rate"] == 0.0     # 旧口径是 0.5（把失败当诚实）
+    assert s["out_of_domain_completed_n"] == 1
+    assert s["out_of_domain_n"] == 2
+
+
+def test_system_fallback_answer_is_not_counted_as_honest():
+    """兜底文案即使被标成 completed，也不能算成「诚实拒答」。"""
+    records = [
+        _rec("completed", 1, [],
+             query={"category": "out_of_domain"},
+             final_answer="[模型调用失败] RuntimeError: boom（这一步没有产生任何工具调用）",
+             final_answer_source="system_fallback"),
+    ]
+
+    s = evaluate(records)
+
+    assert s["out_of_domain_honesty_rate"] == 0.0
+    assert s["out_of_domain_completed_n"] == 1
+
+
+def test_out_of_domain_honesty_rate_is_none_without_completed_runs():
+    """领域外全是失败运行时，诚实率应当是「无法计算」而不是 0 或 1。"""
+    records = [
+        _rec("error", 1, [], query={"category": "out_of_domain"}, final_answer="没有"),
+    ]
+
+    s = evaluate(records)
+
+    assert s["out_of_domain_honesty_rate"] is None
+    assert s["out_of_domain_n"] == 1
+    assert s["out_of_domain_completed_n"] == 0
+
+
+def test_render_markdown_shows_out_of_domain_counts():
+    records = [
+        _rec("completed", 2, ["search_knowledge"],
+             query={"category": "out_of_domain"}, final_answer="没有相关内容。"),
+        _rec("error", 1, [], query={"category": "out_of_domain"}, final_answer="没有"),
+    ]
+
+    md = render_markdown(evaluate(records), records)
+
+    assert "领域外诚实率" in md
+    assert "只统计真正完成的运行" in md
+    assert "**1**" in md and "**2**" in md   # 完成条数 / 领域外总条数

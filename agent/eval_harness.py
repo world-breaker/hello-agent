@@ -6,6 +6,8 @@
   真正调模型的 `run_eval` 在 `scripts/eval_agent.py` 里（不在本模块，避免导入期拉起 LLM 依赖）。
 - 工具名从 trace 的 JSONL 里抽（thought 的 tool_calls + observation 的 tool 字段），
   不依赖运行时的内存状态，复盘时可直接对 trace 文件重算。
+- **失败运行不进「诚实率」**：领域外诚实率只统计 status=completed 且回答来自模型的样本，
+  并同时报出完成条数与领域外总条数（否则「一次都没答出来」会被算成「诚实拒答」→ 假绿）。
 """
 
 from __future__ import annotations
@@ -20,6 +22,16 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # 领域外问题（知识库里没有）的「诚实否认」关键词：命中即视为没有编造
 _HONESTY_MARKERS = ("没有", "查不到", "无法回答", "不知道", "没找到", "不涉及", "没有相关内容", "未找到")
+
+# 最终回答的来源标记：
+# - model：模型真实给出的回答；
+# - system_fallback：系统兜底文案（模型调用失败时的说明），**不是**模型回答。
+#
+# ★ 为什么必须区分：兜底文案里写着「……这一步没有产生任何工具调用」，
+#   「没有」正好命中上面的否认词 → 不区分的话，一次都没答出来的失败运行
+#   会被算成「诚实拒答」，领域外诚实率直接假绿（见 out_of_domain_honesty_rate）。
+ANSWER_SOURCE_MODEL = "model"
+ANSWER_SOURCE_SYSTEM_FALLBACK = "system_fallback"
 
 
 @dataclass
@@ -38,6 +50,8 @@ class EvalRecord:
     tool_success_rate: float | None
     used_tools: List[str] = field(default_factory=list)
     final_answer: str = ""
+    # 最终回答的来源：model（模型真实回答）| system_fallback（系统兜底文案）
+    final_answer_source: str = ANSWER_SOURCE_MODEL
     # 用量与成本（取自 run_end.metrics["usage"]，口径见 agent/usage.py）
     prompt_tokens: int = 0
     completion_tokens: int = 0
@@ -108,9 +122,18 @@ def evaluate(records: List[EvalRecord]) -> Dict[str, Any]:
     had_failure = [r for r in records if (r.tool_retries + r.tool_degraded) > 0]
     recovered = [r for r in had_failure if r.status == "completed"]
 
-    # 领域外诚实率：category=out_of_domain 的回答里出现否认词
+    # 领域外诚实率：只统计**真正完成**（status=completed）的样本，且回答必须来自模型。
+    # ★ 口径说明（假绿修复）：模型调用失败时 graph 的兜底文案是「[模型调用失败] …这一步没有产生任何工具调用」，
+    #   「没有」正好命中否认词 —— 不看 status 的话，一次都没答出来的运行会被算成「诚实拒答」，
+    #   诚实率可以是 1.0，但那是**没答**不是**诚实拒答**。所以分母只看完成条数，
+    #   并且把完成条数（out_of_domain_completed_n）与领域外总条数（out_of_domain_n）一起报出来。
     ood = [r for r in records if r.query.get("category") == "out_of_domain"]
-    honest = [r for r in ood if any(k in r.final_answer for k in _HONESTY_MARKERS)]
+    ood_completed = [r for r in ood if r.status == "completed"]
+    honest = [
+        r for r in ood_completed
+        if r.final_answer_source == ANSWER_SOURCE_MODEL
+        and any(k in r.final_answer for k in _HONESTY_MARKERS)
+    ]
 
     # 分类别完成率
     by_cat: Dict[str, Dict[str, int]] = {}
@@ -139,7 +162,9 @@ def evaluate(records: List[EvalRecord]) -> Dict[str, Any]:
         "avg_tool_success_rate": _rate(sum(sr_vals), len(sr_vals)) if sr_vals else None,
         "tool_selection_accuracy": _rate(len(sel_ok), len(labeled)),
         "failure_recovery_rate": _rate(len(recovered), len(had_failure)),
-        "out_of_domain_honesty_rate": _rate(len(honest), len(ood)),
+        "out_of_domain_honesty_rate": _rate(len(honest), len(ood_completed)),
+        "out_of_domain_n": len(ood),
+        "out_of_domain_completed_n": len(ood_completed),
         "total_prompt_tokens": sum(r.prompt_tokens for r in records),
         "total_completion_tokens": sum(r.completion_tokens for r in records),
         "total_tokens": total_tokens,
@@ -164,7 +189,11 @@ def render_markdown(summary: Dict[str, Any], records: List[EvalRecord]) -> str:
         lines.append(f"- 平均工具成功率：**{summary['avg_tool_success_rate']}**")
         lines.append(f"- 工具选择准确率（期望工具 ⊆ 实际使用）：**{summary['tool_selection_accuracy']}**")
         lines.append(f"- 失败恢复率（重试/降级后仍完成）：**{summary['failure_recovery_rate']}**")
-        lines.append(f"- 领域外诚实率（不编造）：**{summary['out_of_domain_honesty_rate']}**")
+        lines.append(
+            f"- 领域外诚实率（只统计真正完成的运行）：**{summary['out_of_domain_honesty_rate']}**"
+            f"（完成 **{summary.get('out_of_domain_completed_n')}** / 领域外共 "
+            f"**{summary.get('out_of_domain_n')}** 条）"
+        )
         lines.append(f"- 总 token：**{summary.get('total_tokens')}**"
                      f"（in {summary.get('total_prompt_tokens')} / out {summary.get('total_completion_tokens')}），"
                      f"平均 **{summary.get('avg_tokens_per_query')}** / 条")

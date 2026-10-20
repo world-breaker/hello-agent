@@ -112,8 +112,17 @@ def build_agent_graph(
                 f"[模型调用失败] {type(exc).__name__}: {exc}\n"
                 "（已按配置重试 llm.max_retries 次；这一步没有产生任何工具调用）"
             )
+            # ★ 标记来源：这段文案是**系统兜底**，不是模型真实回答。
+            #   它里面含「没有」这类否认词，评测侧若不看来源，会把「一次都没答出来」
+            #   的失败运行算成「诚实拒答」→ 领域外诚实率假绿（见 agent/eval_harness.py）。
+            #   注意：**不改文案本身** —— 失败时如实说明「模型调用失败」正是想要的行为。
             return {
-                "messages": [AIMessage(content=fallback_text)],
+                "messages": [
+                    AIMessage(
+                        content=fallback_text,
+                        additional_kwargs={"answer_source": "system_fallback"},
+                    )
+                ],
                 "steps": state.get("steps", 0) + 1,
                 "status": "llm_error",
             }

@@ -24,6 +24,7 @@ from agent.config import load_config  # noqa: E402
 from agent.eval_harness import (  # noqa: E402
     EvalRecord,
     evaluate,
+    extract_successful_tool_names,
     extract_tool_names,
     load_eval_set,
     render_markdown,
@@ -50,6 +51,7 @@ async def main() -> int:
         m = res.metrics or {}
         usage = m.get("usage") or {}
         used = extract_tool_names(res.trace_path)
+        used_ok = extract_successful_tool_names(res.trace_path)
         records.append(
             EvalRecord(
                 query=q,
@@ -63,6 +65,8 @@ async def main() -> int:
                 circuit_opens=m.get("circuit_opens", 0),
                 tool_success_rate=m.get("tool_success_rate"),
                 used_tools=used,
+                # 「真正执行成功」的工具（observation ok=True）——工具选择准确率用这个口径
+                used_tools_ok=used_ok,
                 final_answer=res.final_answer,
                 # 回答来源：区分「模型真实回答」与「系统兜底文案」，评测侧据此算诚实率
                 final_answer_source=res.final_answer_source,

@@ -16,9 +16,13 @@ sys.path.insert(0, str(REPO_ROOT))
 from agent.eval_harness import (  # noqa: E402
     EvalRecord,
     evaluate,
+    extract_successful_tool_names,
     extract_tool_names,
     render_markdown,
 )
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+TRACES_DIR = REPO_ROOT / "traces"
 
 
 def _write_trace(events: list) -> Path:
@@ -51,6 +55,70 @@ def test_extract_tool_names_from_thought_and_observation():
 
 def test_extract_tool_names_missing_file():
     assert extract_tool_names(Path(tempfile.mktemp(suffix=".jsonl"))) == []
+    assert extract_successful_tool_names(Path(tempfile.mktemp(suffix=".jsonl"))) == []
+
+
+# ---------------- 工具选择：发起过 ≠ 用上了 ----------------
+
+
+def test_extract_successful_tool_names_only_counts_ok_observations():
+    trace = _write_trace([
+        # 模型发起了调用（发起 ≠ 成功）
+        {"ts": 1, "step": 1, "type": "thought", "tool_calls": [
+            {"name": "search_knowledge", "args": {"query": "x"}},
+            {"name": "calculator", "args": {"expression": "1+1"}},
+        ]},
+        # 检索失败
+        {"ts": 2, "step": 1, "type": "observation", "tool": "search_knowledge", "ok": False,
+         "error_class": "timeout"},
+        # 计算成功
+        {"ts": 3, "step": 1, "type": "observation", "tool": "calculator", "ok": True},
+    ])
+    try:
+        assert extract_tool_names(trace) == ["search_knowledge", "calculator"]  # 发起过的都算
+        assert extract_successful_tool_names(trace) == ["calculator"]             # 只有成功执行的算
+    finally:
+        trace.unlink()
+
+
+def test_tool_selection_accuracy_requires_successful_execution():
+    """★ 指标虚高的坑：模型「试过」search_knowledge 但工具全失败、改用记忆硬答，
+    宽口径（发起过）算它选对了，严口径（成功执行过）不算。"""
+    records = [
+        # 期望检索，但检索一次都没成功
+        _rec("completed", 2, ["search_knowledge"],
+             query={"category": "retrieval_only", "expect_tools": ["search_knowledge"]},
+             used_tools_ok=[]),
+        # 期望检索，且检索成功
+        _rec("completed", 2, ["search_knowledge"],
+             query={"category": "retrieval_only", "expect_tools": ["search_knowledge"]},
+             used_tools_ok=["search_knowledge"]),
+    ]
+
+    s = evaluate(records)
+
+    assert s["tool_selection_accuracy"] == 0.5      # 严口径：1/2
+    assert s["tool_selection_attempt_rate"] == 1.0   # 宽口径：2/2（发起过就算）
+    assert s["tool_selection_n"] == 2
+
+
+def test_tool_selection_metrics_recomputed_from_committed_traces():
+    """★ 用仓库里真实留存的 trace 重算：成功执行的工具必须是「发起过」的子集，
+    且真实运行里既有成功的也有失败的 observation（两个口径确实会分开）。"""
+    traces = sorted(TRACES_DIR.glob("*.jsonl"))
+    assert traces, "仓库里应当留有真实 trace"
+
+    all_ok = set()
+    all_attempted = set()
+    for path in traces:
+        ok = extract_successful_tool_names(path)
+        attempted = extract_tool_names(path)
+        assert set(ok) <= set(attempted), f"{path.name}：成功执行的工具不在发起过的集合里"
+        all_ok |= set(ok)
+        all_attempted |= set(attempted)
+
+    assert all_ok, "真实 trace 里应当有成功执行的工具"
+    assert all_ok <= all_attempted
 
 
 def _rec(status, steps, used, query=None, **kw):
@@ -66,6 +134,8 @@ def _rec(status, steps, used, query=None, **kw):
         circuit_opens=kw.get("circuit_opens", 0),
         tool_success_rate=kw.get("tool_success_rate", 1.0),
         used_tools=used,
+        # 「真正执行成功」的工具名：默认与 used 相同，测试里可单独指定（模拟「试过但全失败」）
+        used_tools_ok=kw.get("used_tools_ok", list(used)),
         final_answer=kw.get("final_answer", ""),
         final_answer_source=kw.get("final_answer_source", "model"),
     )
@@ -79,9 +149,10 @@ def test_evaluate_rates():
         # 完成 + 工具选择正确（retrieval_arithmetic）
         _rec("completed", 4, ["search_knowledge", "calculator"],
              query={"category": "retrieval_arithmetic", "expect_tools": ["search_knowledge", "calculator"]}),
-        # 未完成（步数用尽）
+        # 未完成（步数用尽）：最后一步的工具调用根本没执行 → 严口径不算「用上」
         _rec("max_steps_exceeded", 6, ["search_knowledge"],
-             query={"category": "retrieval_only", "expect_tools": ["search_knowledge"]}),
+             query={"category": "retrieval_only", "expect_tools": ["search_knowledge"]},
+             used_tools_ok=[]),
         # 领域外诚实：没查到且如实说没有
         _rec("completed", 2, ["search_knowledge"],
              query={"category": "out_of_domain", "expect_tools": ["search_knowledge"]},
@@ -94,15 +165,19 @@ def test_evaluate_rates():
         _rec("completed", 3, ["search_knowledge"],
              query={"category": "retrieval_only", "expect_tools": ["search_knowledge"]},
              tool_retries=1, tool_success_rate=1.0),
-        # 失败未恢复：重试后仍失败
+        # 失败未恢复：重试后仍失败（工具一次都没成功 → 严口径不算「用上」）
         _rec("error", 3, ["search_knowledge"],
              query={"category": "retrieval_only", "expect_tools": ["search_knowledge"]},
-             tool_retries=3, tool_failed=3, tool_success_rate=0.0),
+             tool_retries=3, tool_failed=3, tool_success_rate=0.0,
+             used_tools_ok=[]),
     ]
     s = evaluate(records)
     assert s["n"] == 7
     assert s["completion_rate"] == round(5 / 7, 4)        # 5 个 completed
-    assert s["tool_selection_accuracy"] == 1.0             # 所有 labeled 的期望工具 ⊆ used
+    # 工具选择：严口径（成功执行过）5/7、宽口径（发起过）7/7
+    assert s["tool_selection_accuracy"] == round(5 / 7, 4)
+    assert s["tool_selection_attempt_rate"] == 1.0
+    assert s["tool_selection_n"] == 7
     assert s["failure_recovery_rate"] == 0.5              # 1/2 发生失败且恢复
     assert s["out_of_domain_honesty_rate"] == 0.5         # 1/2 领域外诚实
     assert s["by_category"]["out_of_domain"]["total"] == 2
@@ -203,3 +278,17 @@ def test_render_markdown_shows_out_of_domain_counts():
     assert "领域外诚实率" in md
     assert "只统计真正完成的运行" in md
     assert "**1**" in md and "**2**" in md   # 完成条数 / 领域外总条数
+
+
+def test_render_markdown_shows_both_tool_selection_calibers():
+    records = [
+        _rec("completed", 2, ["search_knowledge"],
+             query={"category": "retrieval_only", "expect_tools": ["search_knowledge"]},
+             used_tools_ok=[]),
+    ]
+
+    md = render_markdown(evaluate(records), records)
+
+    assert "工具选择准确率" in md and "成功执行过" in md   # 严口径
+    assert "工具选择尝试率" in md and "发起过" in md       # 宽口径
+    assert "n=1" in md                                    # 分母可见

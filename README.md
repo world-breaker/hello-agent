@@ -12,7 +12,7 @@
 
 | 项目 | 事实 | 证据位置 |
 |---|---|---|
-| 离线测试 | `89 passed / 1 skipped`（MCP 端到端测试用环境变量开启） | §7 |
+| 离线测试 | `93 passed / 1 skipped`（MCP 端到端测试用环境变量开启） | §7 |
 | 真实任务 | 三条 demo 全部 `status=completed`（步数 3 / 4 / 2，总耗时 30.97s） | §1 |
 | 最大步数 | `--max-steps 1` 稳定得到「未完成收尾」，不会假完成 | §1.3 |
 | 降级 | 把 MCP 命令改坏后，`auto` 模式如实降级到进程内直连并完成任务 | §1.4 |
@@ -653,6 +653,24 @@ trace 里也能直接看出来（这就是「客观证据」而不是口头声�
 - 领域外诚实率（只统计真正完成的运行）：**1.0**（完成 **1** / 领域外共 **3** 条）
 ```
 
+#### 5.9.2 工具选择：区分「发起过」与「真正用上」
+
+工具选择准确率的原始实现只扫 trace 里的 `tool_calls`（模型**发起**的工具调用），
+于是模型「试了一下 `search_knowledge`、工具全失败、改用记忆硬答」也算「工具选择正确」→ 指标虚高。
+现在两个口径都报出来，分母都是「标了 `expect_tools` 的运行条数」：
+
+| 指标 | 判定 | 用的 trace 证据 |
+|---|---|---|
+| `tool_selection_accuracy`（严，头条指标） | 期望工具 ⊆ **成功执行过**的工具 | `observation` 事件且 `ok=True` |
+| `tool_selection_attempt_rate`（宽） | 期望工具 ⊆ **发起过**的工具 | `thought.tool_calls` + `observation.tool` |
+
+两个数的差值就是「工具发起过但没跑成」的规模；只看严口径会低估模型的选工具能力，
+只看宽口径会高估，所以两个一起报。
+
+> 口径写在代码里也写在文档里：`EvalRecord.used_tools`（发起过）、
+> `EvalRecord.used_tools_ok`（成功执行过），由 `extract_tool_names` /
+> `extract_successful_tool_names` 从 trace 重算——**已有 trace 不用重跑也能换口径重算**。
+
 ---
 
 ## 6. 结构化 trace
@@ -701,7 +719,7 @@ trace 里也能直接看出来（这就是「客观证据」而不是口头声�
 ```text
 > .venv\Scripts\python.exe -m pytest -q
 ........................................................................s......................          [100%]
-89 passed, 1 skipped in 13.64s
+93 passed, 1 skipped in 12.54s
 ```
 
 把 MCP 端到端用例也打开（它会拉起 rag-mcp-server 子进程并加载 BGE 模型，约 10s）：
@@ -757,8 +775,8 @@ python -m pip install -r requirements.txt && python -m pytest -q -rs
 ```
 
 ```text
-# 本机（存在兄弟仓库 rag-mcp-server + BGE 缓存）：89 passed, 1 skipped in 13.64s
-# runner 上不存在兄弟仓库（= GitHub runner 的真实情形）：86 passed, 4 skipped in 3.87s
+# 本机（存在兄弟仓库 rag-mcp-server + BGE 缓存）：93 passed, 1 skipped in 12.54s
+# runner 上不存在兄弟仓库（= GitHub runner 的真实情形）：90 passed, 4 skipped in 3.87s
 #   —— 4 个集成用例走测试自带的 skipif 显式跳过（不是失败），见 tests/test_rag_tool.py
 ```
 
@@ -841,7 +859,7 @@ hello-agent/
 │   └── eval_agent.py          # 批量评测 CLI（落 eval_results/*.json + *.md）
 ├── data/
 │   └── eval_queries.json      # 16 条评测 query（含分类与期望工具）
-├── tests/                     # 89 passed / 1 skipped（+29：用量成本 13 + 断点续跑 8 + 评测口径 8；MCP 端到端需设环境变量）
+├── tests/                     # 93 passed / 1 skipped（+33：用量成本 13 + 断点续跑 8 + 评测口径 12；MCP 端到端需设环境变量）
 │                              #   checkpoint / 演示产物落 data/ 已 gitignore
 ├── traces/                    # 真实运行 trace（JSONL，可回放）
 └── docs/

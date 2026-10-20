@@ -5,7 +5,8 @@
 - **评测逻辑与模型解耦**：`evaluate(records)` 是纯函数，离线可单测；
   真正调模型的 `run_eval` 在 `scripts/eval_agent.py` 里（不在本模块，避免导入期拉起 LLM 依赖）。
 - 工具名从 trace 的 JSONL 里抽（thought 的 tool_calls + observation 的 tool 字段），
-  不依赖运行时的内存状态，复盘时可直接对 trace 文件重算。
+  不依赖运行时的内存状态，复盘时可直接对 trace 文件重算；
+  「发起过」与「成功执行过」是两个口径（extract_tool_names / extract_successful_tool_names）。
 - **失败运行不进「诚实率」**：领域外诚实率只统计 status=completed 且回答来自模型的样本，
   并同时报出完成条数与领域外总条数（否则「一次都没答出来」会被算成「诚实拒答」→ 假绿）。
 """
@@ -48,7 +49,10 @@ class EvalRecord:
     tool_degraded: int
     circuit_opens: int
     tool_success_rate: float | None
+    # used_tools：发起过 / 执行过的工具名（不区分成功失败）
     used_tools: List[str] = field(default_factory=list)
+    # used_tools_ok：**真正执行成功**的工具名（trace 里 observation ok=True 的那些）
+    used_tools_ok: List[str] = field(default_factory=list)
     final_answer: str = ""
     # 最终回答的来源：model（模型真实回答）| system_fallback（系统兜底文案）
     final_answer_source: str = ANSWER_SOURCE_MODEL
@@ -70,10 +74,13 @@ def load_eval_set(path: str | Path) -> List[Dict[str, Any]]:
 
 
 def extract_tool_names(trace_path: str | Path) -> List[str]:
-    """从一次运行的 JSONL trace 里抽出被调用的工具名（去重、保序）。
+    """从一次运行的 JSONL trace 里抽出被调用过的工具名（去重、保序）。
 
     来源：thought 事件的 tool_calls（模型发起）与 observation 事件的 tool 字段（实际执行）。
     任一事件类型缺字段都不影响另一路。
+
+    ★ 口径：这里是「**发起过 / 执行过**」，**不区分成功失败**——
+      想知道「真正用上了哪些工具」（ok=True 的执行），用 extract_successful_tool_names。
     """
     trace_path = Path(trace_path)
     if not trace_path.exists():
@@ -103,6 +110,38 @@ def extract_tool_names(trace_path: str | Path) -> List[str]:
     return names
 
 
+def extract_successful_tool_names(trace_path: str | Path) -> List[str]:
+    """从一次运行的 JSONL trace 里抽出**真正执行成功**的工具名（去重、保序）。
+
+    只认 observation 事件且 `ok=True` 的那一条。
+
+    ★ 为什么要有这个函数：thought 里的 tool_calls 只说明「模型发起了调用」，
+      工具完全可能全部失败（超时 / 降级 / 熔断）。拿「发起过」判断「工具选择正确」，
+      会把「试了一下没成功、最后改用记忆硬答」也算成选对了 → 指标虚高。
+    """
+    trace_path = Path(trace_path)
+    if not trace_path.exists():
+        return []
+    names: List[str] = []
+    seen = set()
+    with trace_path.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if ev.get("type") != "observation" or not ev.get("ok"):
+                continue
+            t = ev.get("tool")
+            if isinstance(t, str) and t not in seen:
+                names.append(t)
+                seen.add(t)
+    return names
+
+
 def evaluate(records: List[EvalRecord]) -> Dict[str, Any]:
     """纯函数：把若干条 EvalRecord 聚合成作品集级指标。离线可单测。"""
     n = len(records)
@@ -111,9 +150,17 @@ def evaluate(records: List[EvalRecord]) -> Dict[str, Any]:
 
     completed = [r for r in records if r.status == "completed"]
 
-    # 工具选择准确率：标注了 expect_tools 的条目里，期望工具集合 ⊆ 实际使用集合即算对
+    # 工具选择：两个口径都报出来，别让「发起过」冒充「用上了」
+    # - tool_selection_accuracy（严）：期望工具 ⊆ **成功执行过**的工具（observation ok=True）
+    # - tool_selection_attempt_rate（宽）：期望工具 ⊆ **发起过**的工具（含执行失败）
+    #   模型「试了 search_knowledge 但工具全失败、改用记忆硬答」时，宽口径算它选对了，
+    #   严口径不算 —— 两个数一起看才知道指标虚不虚。
     labeled = [r for r in records if r.query.get("expect_tools")]
-    sel_ok = [
+    sel_ok_strict = [
+        r for r in labeled
+        if set(r.query["expect_tools"]) <= set(r.used_tools_ok)
+    ]
+    sel_ok_attempt = [
         r for r in labeled
         if set(r.query["expect_tools"]) <= set(r.used_tools)
     ]
@@ -160,7 +207,9 @@ def evaluate(records: List[EvalRecord]) -> Dict[str, Any]:
         "completion_rate": _rate(len(completed), n),
         "avg_steps": round(avg_steps, 2),
         "avg_tool_success_rate": _rate(sum(sr_vals), len(sr_vals)) if sr_vals else None,
-        "tool_selection_accuracy": _rate(len(sel_ok), len(labeled)),
+        "tool_selection_accuracy": _rate(len(sel_ok_strict), len(labeled)),
+        "tool_selection_attempt_rate": _rate(len(sel_ok_attempt), len(labeled)),
+        "tool_selection_n": len(labeled),
         "failure_recovery_rate": _rate(len(recovered), len(had_failure)),
         "out_of_domain_honesty_rate": _rate(len(honest), len(ood_completed)),
         "out_of_domain_n": len(ood),
@@ -187,7 +236,14 @@ def render_markdown(summary: Dict[str, Any], records: List[EvalRecord]) -> str:
         lines.append(f"- 完成率（status=completed）：**{summary['completion_rate']}**")
         lines.append(f"- 平均步数：**{summary['avg_steps']}**")
         lines.append(f"- 平均工具成功率：**{summary['avg_tool_success_rate']}**")
-        lines.append(f"- 工具选择准确率（期望工具 ⊆ 实际使用）：**{summary['tool_selection_accuracy']}**")
+        lines.append(
+            f"- 工具选择准确率（期望工具 ⊆ **成功执行过**的工具）：**{summary['tool_selection_accuracy']}**"
+            f"（n={summary.get('tool_selection_n')}）"
+        )
+        lines.append(
+            f"- 工具选择尝试率（期望工具 ⊆ **发起过**的工具，含执行失败）："
+            f"**{summary.get('tool_selection_attempt_rate')}**"
+        )
         lines.append(f"- 失败恢复率（重试/降级后仍完成）：**{summary['failure_recovery_rate']}**")
         lines.append(
             f"- 领域外诚实率（只统计真正完成的运行）：**{summary['out_of_domain_honesty_rate']}**"

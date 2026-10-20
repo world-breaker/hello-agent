@@ -80,6 +80,8 @@ DEFAULTS: Dict[str, Any] = {
                 "server_command": "../rag-mcp-server/.venv/Scripts/python.exe",
                 "server_script": "../rag-mcp-server/server.py",
                 "cwd": "../rag-mcp-server",
+                # MCP **连接阶段**（拉起子进程 + 握手 + 拉工具列表）的硬上限；<=0 表示不设限。
+                # 真的被 agent/rag_tool.py 读走并生效（超时抛可读错误 → auto 模式降级直连）。
                 "connect_timeout_s": 60,
             },
             "direct": {

@@ -74,6 +74,32 @@ def test_empty_and_secret_content_rejected(tmp_path):
         store.remember("我的 key 是 sk-1234567890abcdef")
 
 
+def test_secret_detection_uses_shape_not_substring(tmp_path):
+    """★ 误拒修复：子串匹配 "sk-" 会把 risk-based / disk-based 这类正常英文词当成密钥。
+
+    现在按**形状**判断（`sk-` + 至少 16 位字母数字，且前面是词边界），
+    正常英文词不再被拒，形似密钥的串仍然被拒。
+    """
+    store = MemoryStore(make_config(tmp_path))
+
+    # 正常内容里含 "sk-"：必须能写进去（记忆是长期数据，误拒比漏判更伤）
+    for content in (
+        "用户偏好 risk-based 的评估流程",
+        "部署在 disk-based 存储上",
+        "任务标记是 task-based 的",
+    ):
+        store.remember(content)
+    assert len(store) == 3
+
+    # 形似密钥的串：仍然拒绝
+    with pytest.raises(ValueError):
+        store.remember("我的 key 是 sk-1234567890abcdef")
+    with pytest.raises(ValueError):
+        store.remember("token=sk-abcdefghijklmnopqrst")
+    with pytest.raises(ValueError):
+        store.remember("OPENAI_API_KEY=whatever")
+
+
 def test_recall_without_overlap_returns_empty(tmp_path):
     store = MemoryStore(make_config(tmp_path))
     store.remember("Transformer 的自注意力机制", key="transformer")

@@ -86,6 +86,40 @@ def test_auto_mode_falls_back_to_direct_when_mcp_is_unavailable(tmp_path):
     os.environ.get("HELLO_AGENT_TEST_MCP") != "1",
     reason="MCP 形态集成测试默认跳过（设 HELLO_AGENT_TEST_MCP=1 运行）",
 )
+def test_mcp_connect_timeout_is_enforced(tmp_path):
+    """★ connect_timeout_s 必须真的生效（不能是「配置里永不生效的选项」）。
+
+    做法：让 MCP Server 子进程只睡觉不回应握手 → 连接阶段必然卡死，
+    于是必须由 connect_timeout_s 兜住，而不是无限期等下去。
+    """
+    import time
+
+    from agent.rag_tool import mcp_rag_tools
+
+    hang = tmp_path / "hang_server.py"
+    hang.write_text("import time\ntime.sleep(60)\n", encoding="utf-8")
+
+    config = load_config()
+    config["tools"]["rag"]["mcp"]["server_command"] = sys.executable
+    config["tools"]["rag"]["mcp"]["server_script"] = str(hang)
+    config["tools"]["rag"]["mcp"]["cwd"] = str(tmp_path)
+    config["tools"]["rag"]["mcp"]["connect_timeout_s"] = 1.0
+
+    tracer = Tracer(tmp_path, console="quiet", run_id="mcptimeout")
+
+    async def _run():
+        async with mcp_rag_tools(config, tracer) as tools:
+            return tools
+
+    started = time.perf_counter()
+    with pytest.raises(TimeoutError) as excinfo:
+        asyncio.run(_run())
+    elapsed = time.perf_counter() - started
+
+    assert "MCP 连接超时" in str(excinfo.value)
+    assert elapsed < 30, f"没有在超时内返回，耗时 {elapsed:.1f}s"
+
+
 def test_mcp_form_end_to_end(tmp_path):
     """MCP 形态：stdio 拉起子进程 → 真实工具调用 → 返回 JSON。"""
     from agent.rag_tool import mcp_rag_tools

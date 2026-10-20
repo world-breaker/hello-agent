@@ -34,8 +34,13 @@ from langchain_core.tools import BaseTool, tool
 _ASCII_RE = re.compile(r"[A-Za-z0-9_]+")
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 
-# 简单密钥特征：sk-xxx / OPENAI_API_KEY=... —— 记忆是长期落盘的，宁可拒绝也不要泄露
-_SECRET_HINTS = ("sk-", "OPENAI_API_KEY", "API_KEY=", "BEGIN PRIVATE KEY")
+# 简单密钥特征：OPENAI_API_KEY=... / BEGIN PRIVATE KEY —— 记忆是长期落盘的，宁可拒绝也不要泄露
+_SECRET_HINTS = ("OPENAI_API_KEY", "API_KEY=", "BEGIN PRIVATE KEY")
+# OpenAI 风格密钥的**形状**：`sk-` 后跟一长串字母/数字（真实 key 至少 16 位）。
+# ★ 为什么用形状而不是子串 "sk-"：risk-based / disk-based / task-based 这类正常英文词
+#   里也含 "sk-"，子串匹配会把整条正常记忆误拒（记忆是长期数据，误拒比漏判更伤）。
+#   形状匹配要求 "sk-" 前面是词边界、后面至少 16 位字母数字 → 上面那些词都不会命中。
+_SECRET_PATTERN = re.compile(r"\bsk-[A-Za-z0-9]{16,}\b", re.IGNORECASE)
 
 
 def _tokens(text: str) -> List[str]:
@@ -188,8 +193,8 @@ class MemoryStore:
         if len(content) > self.max_content_chars:
             content = content[: self.max_content_chars] + "…（已截断）"
         lowered = content.lower()
-        if any(hint.lower() in lowered for hint in _SECRET_HINTS):
-            raise ValueError("记忆内容疑似包含密钥（sk- / API_KEY），拒绝落盘")
+        if any(hint.lower() in lowered for hint in _SECRET_HINTS) or _SECRET_PATTERN.search(content):
+            raise ValueError("记忆内容疑似包含密钥（形似 sk-… 的串 / API_KEY=…），拒绝落盘")
 
         key = (key or "").strip() or f"mem_{uuid.uuid4().hex[:8]}"
         record = MemoryRecord(

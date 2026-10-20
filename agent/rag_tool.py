@@ -14,10 +14,11 @@
     代价：BGE 模型会加载进 Agent 进程（约 5s、几百 MB 内存），且与 Agent 共享生命周期。
 """
 
+import asyncio
 import json
 import sys
 import time
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict
 
@@ -39,12 +40,19 @@ async def mcp_rag_tools(config: Dict[str, Any], tracer: Tracer):
     关键点：整个任务期间**复用同一个 MCP 会话**（`client.session(...)` 上下文），
     而不是「每个工具调用开一次会话」——否则每次调用都会重启 server 子进程、
     重新加载 BGE 模型 + 重建索引（每次多花好几秒），这是实打实的成本问题。
+
+    ★ 连接超时（`tools.rag.mcp.connect_timeout_s`）：连接阶段 = 拉起子进程 + 握手
+      （initialize）+ 拉工具列表。MCP Server 挂起时这一步会**一直等下去**，
+      于是整个任务卡死。现在这段有硬上限：超时抛可读的 TimeoutError，
+      `auto` 模式会被 toolkit 捕获并降级到进程内直连（trace 里留 toolset_fallback）。
+      注意只给「连接阶段」加超时，**会话建立后的正常使用期不受影响**。
     """
     from langchain_mcp_adapters.client import MultiServerMCPClient
     from langchain_mcp_adapters.tools import load_mcp_tools
 
     mcp_cfg = config["tools"]["rag"]["mcp"]
     server_name = "rag-knowledge"
+    connect_timeout_s = float(mcp_cfg.get("connect_timeout_s") or 0)
     connection = {
         "transport": "stdio",
         "command": str(mcp_cfg["server_command"]),
@@ -59,8 +67,21 @@ async def mcp_rag_tools(config: Dict[str, Any], tracer: Tracer):
 
     client = MultiServerMCPClient({server_name: connection})
     started = time.perf_counter()
-    async with client.session(server_name) as session:
-        tools = await load_mcp_tools(session)
+    # AsyncExitStack：会话要活过 yield（任务期间复用），所以不能直接用 with
+    async with AsyncExitStack() as stack:
+        try:
+            enter = stack.enter_async_context(client.session(server_name))
+            if connect_timeout_s > 0:
+                session = await asyncio.wait_for(enter, timeout=connect_timeout_s)
+                tools = await asyncio.wait_for(load_mcp_tools(session), timeout=connect_timeout_s)
+            else:
+                session = await enter
+                tools = await load_mcp_tools(session)
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError(
+                f"MCP 连接超时（connect_timeout_s={connect_timeout_s}s）：{server_name} "
+                f"没能在时限内完成「拉起子进程 + 握手 + 拉工具列表」。"
+            ) from exc
         connect_ms = round((time.perf_counter() - started) * 1000, 2)
         tracer.event(
             "toolset",
@@ -70,6 +91,7 @@ async def mcp_rag_tools(config: Dict[str, Any], tracer: Tracer):
             server_script=connection["args"],
             tools=[t.name for t in tools],
             connect_ms=connect_ms,
+            connect_timeout_s=connect_timeout_s,
         )
         yield {t.name: t for t in tools}
 

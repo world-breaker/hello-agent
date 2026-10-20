@@ -12,7 +12,7 @@
 
 | 项目 | 事实 | 证据位置 |
 |---|---|---|
-| 离线测试 | `93 passed / 1 skipped`（MCP 端到端测试用环境变量开启） | §7 |
+| 离线测试 | `95 passed / 1 skipped`（MCP 端到端测试用环境变量开启） | §7 |
 | 真实任务 | 三条 demo 全部 `status=completed`（步数 3 / 4 / 2，总耗时 30.97s） | §1 |
 | 最大步数 | `--max-steps 1` 稳定得到「未完成收尾」，不会假完成 | §1.3 |
 | 降级 | 把 MCP 命令改坏后，`auto` 模式如实降级到进程内直连并完成任务 | §1.4 |
@@ -46,7 +46,7 @@ Demo 2: status=completed 步数=4 工具调用=4 成功=4 失败=0 重试=0 降�
         trace: ...\hello-agent\traces\run_20261016-132747_e6fca8de.jsonl
 Demo 3: status=completed 步数=2 工具调用=2 成功=2 失败=0 重试=0 降级=0 RAG形态=mcp 耗时=8790.31ms
         trace: ...\hello-agent\traces\run_20261016-132759_751d7e9a.jsonl
-总耗时 30.97s；trace 目录：D:\programmer\LLM\projects\hello-agent\traces
+总耗时 30.97s；trace 目录：<repo>/traces
 ```
 
 ### 1.2 Demo 1：多步工具组合（检索 → 计算 → 取时间）
@@ -244,6 +244,8 @@ flowchart TB
 
 `auto` 降级分两层，都在 trace 里留证：
 - **会话建不起来**（进程启动失败、握手超时）→ 直接改用直连工具，记 `toolset_fallback` 事件；
+  连接阶段有硬上限 `tools.rag.mcp.connect_timeout_s`（默认 60s，覆盖「拉起子进程 + 握手 + 拉工具列表」，
+  超时抛可读错误，不会无限期卡住整条任务）；
 - **会话可用但调用失败**（重试耗尽）→ `ToolExecutor` 触发该工具的 fallback（懒加载，正常路径永不把 BGE 拉进 Agent 进程），记 `degrade` 事件。
 
 > 依赖版本事实：`langchain-mcp-adapters==0.3.2` 要求 `mcp<2`，所以这里客户端是 **mcp 1.30.0**，
@@ -406,7 +408,7 @@ agent:
 | **同 key 后写覆盖** | 不引入数据库就获得 upsert 语义；读取时只保留最新视图 |
 | **BM25 召回（英文词 + 中文单字/二元组）** | 比「词重叠比例」更合理：idf 让稀有词（项目名/术语）权重更高，`b` 做文档长度归一化；零依赖、可解释、离线可跑。`recall_mode: "overlap"` 可切回旧算法做 A/B |
 | **只注入命中的 top-k** | 与任务无关键词重叠就不注入，避免把无关记忆塞进 prompt |
-| **拒绝疑似密钥** | 记忆是长期落盘的，`sk-` / `API_KEY=` 直接拒绝，避免把密钥写进磁盘 |
+| **拒绝疑似密钥** | 记忆是长期落盘的，`API_KEY=` / 形似 `sk-…` 的串直接拒绝，避免把密钥写进磁盘。判定按**形状**（`sk-` + ≥16 位字母数字）而不是子串 —— 否则 `risk-based` / `disk-based` 这类正常英文词会被整条误拒 |
 
 配置（`config.yaml`）：
 
@@ -681,7 +683,7 @@ trace 里也能直接看出来（这就是「客观证据」而不是口头声�
 | type | 含义 |
 |---|---|
 | `run_start` | 任务开始：任务文本、**脱敏后的**端点信息（`api_key=sk-****`）、max_steps、rag_mode、`thread_id` |
-| `toolset` / `toolset_fallback` / `tools_ready` | 工具集就绪：MCP 连接耗时（`connect_ms`）、工具名、降级原因 |
+| `toolset` / `toolset_fallback` / `tools_ready` | 工具集就绪：MCP 连接耗时（`connect_ms`）与连接超时上限（`connect_timeout_s`）、工具名、降级原因 |
 | `checkpoint_ready` | 断点续跑就绪：后端（`sqlite` / `jsonl` / `disabled`）、thread_id、落盘路径、降级说明 |
 | `resume_detected` / `resume_noop` | 检测到未完成状态（含 `next_nodes` / `steps_done`）→ 本次是续跑；或 `--resume` 但没东西可续 |
 | `llm_call` | 一次模型调用：耗时 + token 用量（`input_tokens/output_tokens/total_tokens`） |
@@ -719,7 +721,7 @@ trace 里也能直接看出来（这就是「客观证据」而不是口头声�
 ```text
 > .venv\Scripts\python.exe -m pytest -q
 ........................................................................s......................          [100%]
-93 passed, 1 skipped in 12.54s
+95 passed, 1 skipped in 17.32s
 ```
 
 把 MCP 端到端用例也打开（它会拉起 rag-mcp-server 子进程并加载 BGE 模型，约 10s）：
@@ -775,8 +777,8 @@ python -m pip install -r requirements.txt && python -m pytest -q -rs
 ```
 
 ```text
-# 本机（存在兄弟仓库 rag-mcp-server + BGE 缓存）：93 passed, 1 skipped in 12.54s
-# runner 上不存在兄弟仓库（= GitHub runner 的真实情形）：90 passed, 4 skipped in 3.87s
+# 本机（存在兄弟仓库 rag-mcp-server + BGE 缓存）：95 passed, 1 skipped in 17.32s
+# runner 上不存在兄弟仓库（= GitHub runner 的真实情形）：92 passed, 4 skipped in 3.87s
 #   —— 4 个集成用例走测试自带的 skipif 显式跳过（不是失败），见 tests/test_rag_tool.py
 ```
 
@@ -859,7 +861,7 @@ hello-agent/
 │   └── eval_agent.py          # 批量评测 CLI（落 eval_results/*.json + *.md）
 ├── data/
 │   └── eval_queries.json      # 16 条评测 query（含分类与期望工具）
-├── tests/                     # 93 passed / 1 skipped（+33：用量成本 13 + 断点续跑 8 + 评测口径 12；MCP 端到端需设环境变量）
+├── tests/                     # 95 passed / 1 skipped（+35：用量成本 13 + 断点续跑 8 + 评测口径 12 + 小修 2；MCP 端到端需设环境变量）
 │                              #   checkpoint / 演示产物落 data/ 已 gitignore
 ├── traces/                    # 真实运行 trace（JSONL，可回放）
 └── docs/

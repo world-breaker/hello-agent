@@ -57,6 +57,8 @@ tools:
       server_command: "../rag-mcp-server/.venv/Scripts/python.exe"
       server_script: "../rag-mcp-server/server.py"
       cwd: "../rag-mcp-server"
+      # MCP 连接阶段的硬上限（秒）：拉起子进程 + 握手 + 拉工具列表。
+      # 超时抛可读错误 → auto 模式自动降级到进程内直连（trace 里留 toolset_fallback）；<=0 表示不设限。
       connect_timeout_s: 60
     direct:
       # 降级/轻量形态：把 rag-mcp-server 仓库加进 sys.path，进程内直连同源检索

@@ -1,7 +1,13 @@
 """RAG 工具两种形态的集成测试（会真的加载 BGE 模型 / 真的拉起 MCP 子进程）。
 
 - 直连形态（direct）：默认就跑，前提是本机存在同源仓库 rag-mcp-server（否则 skip）；
-- MCP 形态：默认 skip，设 `HELLO_AGENT_TEST_MCP=1` 才跑（因为它会启动子进程、加载模型，约 10s）。
+- MCP 形态有两个用例，行为不同：
+  · `test_mcp_connect_timeout_is_enforced`：**默认 skip**，设 `HELLO_AGENT_TEST_MCP=1` 才跑
+    （它会挂一个只睡觉不握手的假 server，故意把连接阶段卡死）；
+  · `test_mcp_form_end_to_end`：**默认就跑**（它是本项目最强的集成证据——真的拉起 MCP 子进程
+    并完成一次真实工具调用），但同样要求本机存在同源仓库 rag-mcp-server 与 BGE 缓存，
+    **CI runner 上没有兄弟仓库 → 自动 skip**（2026-10-21 修：此前它漏挂了 skipif，
+    在 GitHub Actions 上因找不到兄弟仓库而失败）。
   真实使用中的 MCP 端到端证据见 README 的 demo 日志（`--rag-mode mcp`）。
 """
 
@@ -120,8 +126,12 @@ def test_mcp_connect_timeout_is_enforced(tmp_path):
     assert elapsed < 30, f"没有在超时内返回，耗时 {elapsed:.1f}s"
 
 
+@requires_rag_repo
 def test_mcp_form_end_to_end(tmp_path):
-    """MCP 形态：stdio 拉起子进程 → 真实工具调用 → 返回 JSON。"""
+    """MCP 形态：stdio 拉起子进程 → 真实工具调用 → 返回 JSON。
+
+    需要同源仓库 rag-mcp-server（CI runner 上没有 → skip，见模块 docstring）。
+    """
     from agent.rag_tool import mcp_rag_tools
 
     config = load_config()

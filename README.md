@@ -1,5 +1,7 @@
 # hello-agent —— 最小 ReAct Agent + 工具调用（LangGraph）
 
+**仓库地址**：Gitee https://gitee.com/tmlKevin/hello-agent ｜ GitHub https://github.com/world-breaker/hello-agent
+
 [![CI](https://github.com/world-breaker/hello-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/world-breaker/hello-agent/actions/workflows/ci.yml)
 
 > **一句话**：用 **LangGraph 手写**「模型思考 → 调用工具 → 观察结果 → 再思考」的循环，

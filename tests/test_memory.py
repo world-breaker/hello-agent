@@ -15,6 +15,10 @@ from agent.memory import (  # noqa: E402
     build_memory_tools,
 )
 
+# 形似密钥的**假**串：运行时拼出来，而不是把「密钥形状」的字面量写进源码
+# （源码里不该出现这种字面量：既容易让密钥扫描器误报，也不该出现在任何仓库里）
+_FAKE_SK = "sk-" + "0" * 20
+
 
 def make_config(tmp_path: Path, **overrides) -> dict:
     config = load_config()
@@ -71,7 +75,7 @@ def test_empty_and_secret_content_rejected(tmp_path):
         store.remember("   ")
 
     with pytest.raises(ValueError):
-        store.remember("我的 key 是 sk-1234567890abcdef")
+        store.remember("我的 key 是 " + _FAKE_SK)
 
 
 def test_secret_detection_uses_shape_not_substring(tmp_path):
@@ -93,9 +97,9 @@ def test_secret_detection_uses_shape_not_substring(tmp_path):
 
     # 形似密钥的串：仍然拒绝
     with pytest.raises(ValueError):
-        store.remember("我的 key 是 sk-1234567890abcdef")
+        store.remember("我的 key 是 " + _FAKE_SK)
     with pytest.raises(ValueError):
-        store.remember("token=sk-abcdefghijklmnopqrst")
+        store.remember("token=" + _FAKE_SK)
     with pytest.raises(ValueError):
         store.remember("OPENAI_API_KEY=whatever")
 

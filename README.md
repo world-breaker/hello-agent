@@ -1,5 +1,7 @@
 # hello-agent —— 最小 ReAct Agent + 工具调用（LangGraph）
 
+[![CI](https://github.com/world-breaker/hello-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/world-breaker/hello-agent/actions/workflows/ci.yml)
+
 > **一句话**：用 **LangGraph 手写**「模型思考 → 调用工具 → 观察结果 → 再思考」的循环，
 > 工具包括**经 MCP 客户端接入的 RAG 检索**（复用项目一 [rag-mcp-server](../rag-mcp-server)）、
 > **计算器**与**当前时间**；并把 Agent 里最容易出问题的三件事做成显式机制：
@@ -758,9 +760,11 @@ trace 里也能直接看出来（这就是「客观证据」而不是口头声�
 那套测试有自动化门禁：`ubuntu-latest` + Python 3.12 + `pip` 依赖缓存 + `pytest -q -rs`，
 job 级设了离线变量，**不需要密钥、也不会下载模型**。
 
-> **宿主如实说明**：本仓库托管在 **Gitee（公开仓库）**，Gitee 不会执行 GitHub Actions，也还没接 Gitee Go。
+> **宿主如实说明**：本仓库**同时托管在 Gitee 与 GitHub**（两边是同一份历史、同一批 commit SHA）。
+> **GitHub 侧 Actions 会执行**：每次 push / PR 自动跑一遍测试（本文顶部的徽章是真实运行状态，不是摆设）；
+> Gitee 侧不执行 GitHub Actions（若日后接 Gitee Go 另配）。
 > 这份 YAML 用的是**通用 GitHub Actions 格式**——镜像一份到 GitHub 即可直接生效，但在 Gitee 侧目前不是自动跑的流水线。
-> 因此 README 里**不放 CI 徽章**：徽章指向 GitHub Actions，而本仓库的流水线在 Gitee 侧不会跑，徽章只会 404。
+> 因此 README **挂 CI 徽章**：它指向 GitHub Actions 的真实运行状态（仓库已镜像到 GitHub）。
 
 为什么这样设环境变量（每条都对着一个真实坑，不是仪式感）：
 

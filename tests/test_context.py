@@ -97,3 +97,49 @@ def test_compression_is_idempotent():
     assert stats_first["compressed"] is True
     assert stats_second["compressed"] is False
     assert [m.content for m in second] == [m.content for m in first]
+
+
+# ---------------- max_chars 是「目标预算」，不是硬上限 ----------------
+
+
+def test_under_budget_reports_no_overrun():
+    """压进预算时：over_budget=False、超出 0 字符、没用到底线。"""
+    messages = build_messages(n_pairs=8)
+    _, stats = compress_messages(messages, max_chars=2000, keep_last=3)
+
+    assert stats["compressed"] is True
+    assert stats["after_chars"] <= stats["max_chars"]
+    assert stats["over_budget"] is False
+    assert stats["over_budget_chars"] == 0
+    assert stats["budget_floor_hit"] is False
+
+
+def test_over_budget_is_reported_not_hidden():
+    """★ 压不下来说得出来：三档预览用完仍然超预算时，stats 必须明确标出来。
+
+    30 轮工具调用（≈9600 字符）在 2000 字符预算下，三档预览（120 / 40 / 0）都用完
+    仍然超预算（压完 2720 字符）—— 这是**不能靠删消息解决的**（删了会破坏
+    tool_calls ↔ ToolMessage 配对），所以必须把它变成**可感知**的信号，
+    而不是让调用方以为「压进预算了」。
+    """
+    messages = build_messages(n_pairs=30)
+    output, stats = compress_messages(messages, max_chars=2000, keep_last=3)
+
+    assert stats["compressed"] is True
+    assert stats["after_chars"] > stats["max_chars"]          # 确实超了
+    assert stats["over_budget"] is True
+    assert stats["over_budget_chars"] == stats["after_chars"] - stats["max_chars"]
+    assert stats["budget_floor_hit"] is True                  # 三档预览用完仍超 → 触底
+    # 行为没变：仍然只压内容、不删消息
+    assert len(output) == len(messages)
+
+
+def test_noop_case_reports_budget_fields():
+    """没触发压缩时，预算相关字段也要在（缺字段会让下游统计写代码变脆）。"""
+    messages = build_messages(n_pairs=2)
+    _, stats = compress_messages(messages, max_chars=10**9, keep_last=3)
+
+    assert stats["compressed"] is False
+    assert stats["over_budget"] is False
+    assert stats["over_budget_chars"] == 0
+    assert stats["budget_floor_hit"] is False

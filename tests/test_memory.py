@@ -1,7 +1,14 @@
-"""跨任务长期记忆单测（离线、无 LLM）：持久化 / 覆盖 / 召回 / 工具 / 注入。"""
+"""跨任务长期记忆单测（离线、无 LLM）：持久化 / 覆盖 / 召回 / 工具 / 注入。
+
+覆盖的新增能力（2026-10-21 审计修复）：
+- 召回的 key 加权是**子串包含**（注释曾经写成「精确命中」）；
+- 配置键 `max_records` 改名 `compact_threshold`（它的真实语义不是「记录条数上限」）；
+- 记忆的**删除 / 过期 / 来源 / 核验**，以及**旧格式 JSONL 仍可加载**。
+"""
 
 import json
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -22,10 +29,12 @@ def make_config(tmp_path: Path, **overrides) -> dict:
         {
             "enabled": True,
             "path": str(tmp_path / "agent_memory.jsonl"),
-            "max_records": 50,
+            # ★ 新键名（旧的 max_records 仍兼容，见 test_legacy_max_records_key_still_works）
+            "compact_threshold": 50,
             "max_content_chars": 200,
         }
     )
+    config["memory"].pop("max_records", None)
     config["memory"].update(overrides)
     return config
 
@@ -230,3 +239,196 @@ def test_bm25_beats_overlap_on_long_distractor(tmp_path):
     assert overlap_top["key"] == "distractor", (
         f"overlap 未被长文档带偏（本用例失去对照意义）：{overlap_top}"
     )
+
+
+# ---------------- ④ key 加权是「子串包含」，不是「精确命中」 ----------------
+
+
+def test_recall_key_bonus_uses_substring_matching(tmp_path):
+    """★ 召回里的 key 加权实现是 `record.key.lower() in query_lower` —— **子串包含**。
+
+    注释曾经写成「key 精确命中」，与实现不一致（注释已按实现改正）。
+    这里刻意用一个「不是分词结果、但确实是子串」的 key 来隔离这条规则：
+    key="pre" 会被 query="preference …" 命中（"pre" 不是分词器切出来的词，
+    所以它能被命中只可能来自子串包含这一条）。
+    """
+    store = MemoryStore(make_config(tmp_path))
+    store.remember("数据库配置说明", key="pre")
+
+    with_key = store.recall("preference 数据库配置", top_k=3)
+    without_key = store.recall("数据库配置", top_k=3)
+
+    assert with_key and without_key
+    assert with_key[0]["key"] == "pre"
+    # 子串命中比不命中多 0.5 分（实现里写死的确定性加权）
+    assert with_key[0]["score"] - without_key[0]["score"] == pytest.approx(0.5, abs=1e-3)
+
+
+def test_recall_key_bonus_not_applied_when_key_absent(tmp_path):
+    """key 不在 query 里 → **不给**那 0.5 的 key 加权（两个 key 分数应当相同）。"""
+    store = MemoryStore(make_config(tmp_path))
+    store.remember("数据库配置说明", key="pre")
+    store.remember("数据库配置说明", key="zzz")
+
+    hits = store.recall("数据库配置", top_k=5)
+    scores = {hit["key"]: hit["score"] for hit in hits}
+    assert set(scores) == {"pre", "zzz"}
+    assert scores["pre"] == scores["zzz"]
+
+
+# ---------------- ⑤ compact_threshold：真实语义不是「记录条数上限」 ----------------
+
+
+def test_compact_threshold_is_dedup_trigger_not_record_cap(tmp_path):
+    """★ `compact_threshold` 的真实语义：**JSONL 文件行数**超过它就重写文件
+    （同 key 只留最新）。它**不是**记录条数上限 —— 写 10 条不同 key 的记录，
+    文件里仍然是 10 行（重写只去重，不淘汰）。"""
+    config = make_config(tmp_path, compact_threshold=5)
+    store = MemoryStore(config)
+    for index in range(10):
+        store.remember(f"第 {index} 条记忆", key=f"k{index}")
+
+    lines = [l for l in Path(store.path).read_text(encoding="utf-8").splitlines() if l.strip()]
+    assert len(lines) == 10      # ★ 不是上限：10 条不同 key 全都在
+    assert len(store) == 10
+    assert store.compact_threshold == 5
+
+
+def test_legacy_max_records_key_still_works(tmp_path):
+    """★ 向后兼容：老配置里的 `max_records` 仍然生效（值照旧），并给一条告警。"""
+    config = make_config(tmp_path)
+    config["memory"]["max_records"] = 7
+    config["memory"].pop("compact_threshold", None)
+
+    with pytest.warns(DeprecationWarning):
+        store = MemoryStore(config)
+
+    assert store.compact_threshold == 7
+    assert store.max_records == 7      # 旧属性名仍可读（老代码不会 AttributeError）
+
+
+def test_new_compact_threshold_wins_over_stale_legacy_key(tmp_path):
+    """新键名给了非默认值时以新键名为准（老键名只是残留，不该反过来覆盖它）。"""
+    config = make_config(tmp_path, compact_threshold=5)
+    config["memory"]["max_records"] = 999
+    store = MemoryStore(config)
+    assert store.compact_threshold == 5
+
+
+# ---------------- ⑥ 删除 / 过期 / 来源 / 核验 ----------------
+
+
+def test_forget_deletes_and_persists(tmp_path):
+    """★ 记忆能写就能删：forget(key) 删除并立即落盘。"""
+    store = MemoryStore(make_config(tmp_path))
+    store.remember("用户的默认语言是中文", key="lang")
+    store.remember("项目路径在 D:/programmer/LLM", key="path")
+
+    assert store.forget("lang") is True
+    assert store.forget("lang") is False      # 再删一次：已经没有这条了
+    assert store.forget("") is False
+    assert [r["key"] for r in store.all()] == ["path"]
+
+    # 落盘生效：新实例（模拟重启）里也没有了
+    reloaded = MemoryStore(make_config(tmp_path))
+    assert [r["key"] for r in reloaded.all()] == ["path"]
+
+
+def test_ttl_expires_records_and_cleans_them_on_load(tmp_path):
+    """★ 过期记录不参与召回，加载时顺手清掉（文件里也不再留）。"""
+    config = make_config(tmp_path)
+    store = MemoryStore(config)
+    store.remember("马上过期的记忆：咖啡", key="temp", ttl_seconds=1)
+    store.remember("长期有效的记忆：茶", key="perm")
+
+    records = {r["key"]: r for r in store.all()}
+    assert records["temp"]["expires_at"] != ""      # 带 TTL 的记录写了到期时刻
+    assert records["perm"]["expires_at"] == ""      # 没给 TTL → 永不过期
+
+    time.sleep(1.1)
+
+    hits = store.recall("记忆", top_k=5)
+    assert "temp" not in [h["key"] for h in hits]
+    assert len(store) == 1
+
+    # 重新加载时清理：文件里那条过期记录被去掉
+    reloaded = MemoryStore(config)
+    assert [r["key"] for r in reloaded.all()] == ["perm"]
+    assert "temp" not in Path(store.path).read_text(encoding="utf-8")
+
+
+def test_source_and_verified_are_recorded_and_filterable(tmp_path):
+    """★ 每条记忆带来源与「是否已核验」；召回能按「已核验」过滤。"""
+    store = MemoryStore(make_config(tmp_path))
+    store.remember("用户的默认语言是中文", key="lang", source="用户明说", verified=True)
+    store.remember("用户可能住在武汉", key="city", source="模型推断", verified=False)
+
+    hits = {h["key"]: h for h in store.recall("用户 默认语言 住在", top_k=5)}
+    assert hits["lang"]["source"] == "用户明说"
+    assert hits["lang"]["verified"] is True
+    assert hits["city"]["source"] == "模型推断"
+    assert hits["city"]["verified"] is False
+
+    # 只取已核验的
+    only = store.recall("用户 默认语言 住在", top_k=5, only_verified=True)
+    assert [h["key"] for h in only] == ["lang"]
+
+
+def test_old_format_memory_file_still_loads(tmp_path):
+    """★ 向后兼容：旧 JSONL（没有 source / verified / expires_at 字段）照样能读。"""
+    path = tmp_path / "agent_memory.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "key": "lang",
+                "content": "用户的默认语言是中文",
+                "tags": ["偏好"],
+                "created_at": "2026-01-01T10:00:00+08:00",
+                "run_id": "old-run",
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    store = MemoryStore(make_config(tmp_path))
+    assert len(store) == 1
+    record = store.all()[0]
+    assert record["key"] == "lang"
+    assert record["source"] == ""           # 缺字段 → 取默认值
+    assert record["verified"] is False
+    assert record["expires_at"] == ""
+
+    hits = store.recall("默认语言", top_k=3)
+    assert hits and hits[0]["key"] == "lang"
+
+
+def test_memory_tool_supports_source_and_verified(tmp_path):
+    """工具层也要能带来源/核验标记，并且 recall 能按「已核验」过滤。"""
+    store = MemoryStore(make_config(tmp_path))
+    tools = build_memory_tools(store)
+
+    saved = json.loads(
+        tools["remember_fact"].invoke(
+            {
+                "content": "回答时要先检索知识库",
+                "key": "rule",
+                "tags": "规则,检索",
+                "source": "用户明说",
+                "verified": True,
+            }
+        )
+    )
+    assert saved["ok"] is True
+    assert saved["source"] == "用户明说"
+    assert saved["verified"] is True
+
+    recalled = json.loads(
+        tools["recall_memory"].invoke({"query": "检索 规则", "top_k": 3, "only_verified": True})
+    )
+    assert recalled["ok"] is True
+    assert recalled["count"] == 1
+    assert recalled["results"][0]["verified"] is True
+    assert recalled["results"][0]["source"] == "用户明说"
+

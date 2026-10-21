@@ -133,6 +133,101 @@ def test_fallback_is_used_after_retries_exhausted(tmp_path):
     assert "degrade" in [e["type"] for e in tracer.events]
 
 
+# ---------------- 结局口径：ok / degraded / failed 互斥 ----------------
+
+
+def test_degraded_success_is_not_counted_as_failure(tmp_path):
+    """★ 口径修复：降级成功（主通道坏、fallback 好）之前被记成了**失败**。
+
+    早先的实现：进降级分支之前就 `stats["failed"] += 1`，降级成功时既不加 `ok`
+    也不减 `failed` → 「降级成功」被算成失败，`ok / calls` 的成功率直接变成 0，
+    而且 `ok + failed` 还大于 `calls`（口径自相矛盾）。
+    现在三类互斥：ok（主通道成功）/ degraded（降级成功）/ failed（最终失败）。
+    """
+    tool, _ = make_tool("search_knowledge", fail_times=99, exc_factory=lambda: TimeoutError("timed out"))
+    config = load_config()
+    config["tools"]["retry"]["backoff_base_s"] = 0.01
+    tracer = Tracer(tmp_path, console="quiet")
+
+    executor = ToolExecutor(
+        {"search_knowledge": tool},
+        config,
+        tracer,
+        fallbacks={"search_knowledge": lambda args: json.dumps({"matched": 1}, ensure_ascii=False)},
+    )
+    outcome = asyncio.run(executor.execute("search_knowledge", {"query": "x"}))
+
+    assert outcome.ok is True
+    assert outcome.degraded is True
+    stats = executor.stats
+    assert stats["calls"] == 1
+    assert stats["ok"] == 0            # 主通道没成功
+    assert stats["degraded"] == 1      # 降级成功
+    assert stats["failed"] == 0        # ★ 不再被算成失败
+    # 三类互斥且穷尽
+    assert stats["ok"] + stats["degraded"] + stats["failed"] == stats["calls"]
+    # 成功率（含降级成功）= 1.0
+    assert (stats["ok"] + stats["degraded"]) / stats["calls"] == 1.0
+
+
+def test_tool_outcome_categories_are_mutually_exclusive(tmp_path):
+    """一次运行里的各种结局加起来必须等于调用总数（否则成功率的分母是错的）。"""
+    good, _ = make_tool("good")
+    degraded_tool, _ = make_tool("degraded_tool", fail_times=99,
+                                  exc_factory=lambda: ConnectionError("refused"))
+    hard, _ = make_tool("hard", fail_times=99, exc_factory=lambda: ConnectionError("refused"))
+    blocked, _ = make_tool("blocked", fail_times=99, exc_factory=lambda: ConnectionError("refused"))
+
+    config = load_config()
+    config["tools"]["retry"].update({"max_attempts": 1, "backoff_base_s": 0.01})
+    config["tools"]["circuit_breaker"]["failure_threshold"] = 1
+    tracer = Tracer(tmp_path, console="quiet")
+    executor = ToolExecutor(
+        {t.name: t for t in (good, degraded_tool, hard, blocked)},
+        config,
+        tracer,
+        fallbacks={"degraded_tool": lambda args: "降级结果"},
+    )
+
+    asyncio.run(executor.execute("good", {}))            # ok
+    asyncio.run(executor.execute("degraded_tool", {}))    # degraded
+    asyncio.run(executor.execute("hard", {}))             # failed（无 fallback）
+    asyncio.run(executor.execute("nonexistent", {}))      # failed（unknown_tool）
+    asyncio.run(executor.execute("blocked", {}))          # failed（真失败，并打开熔断）
+    asyncio.run(executor.execute("blocked", {}))          # failed（熔断打开 → 直接拒）
+
+    stats = executor.stats
+    assert stats["calls"] == 6
+    assert stats["ok"] == 1
+    assert stats["degraded"] == 1
+    assert stats["failed"] == 4
+    assert stats["ok"] + stats["degraded"] + stats["failed"] == stats["calls"]
+    # 熔断是**按工具**计的：degraded_tool / hard / blocked 三个工具各失败一次，
+    # 阈值=1 → 三个熔断器各打开一次
+    assert stats["circuit_opens"] == 3
+    assert executor.breaker_open["blocked"] is True
+
+
+def test_degraded_success_is_visible_in_trace_observation(tmp_path):
+    """降级成功要在 trace 的 observation 里留证（离线重算工具口径时要用到）。"""
+    tool, _ = make_tool("search_knowledge", fail_times=99, exc_factory=lambda: TimeoutError("timed out"))
+    config = load_config()
+    config["tools"]["retry"]["backoff_base_s"] = 0.01
+    tracer = Tracer(tmp_path, console="quiet")
+    executor = ToolExecutor(
+        {"search_knowledge": tool},
+        config,
+        tracer,
+        fallbacks={"search_knowledge": lambda args: "降级结果"},
+    )
+    asyncio.run(executor.execute("search_knowledge", {"query": "x"}))
+
+    observations = [e for e in tracer.events if e["type"] == "observation"]
+    assert len(observations) == 1
+    assert observations[0]["ok"] is True
+    assert observations[0]["degraded"] is True
+
+
 # ---------------- 熔断 ----------------
 
 
@@ -161,6 +256,40 @@ def test_circuit_breaker_resets_after_success(tmp_path):
     ok = asyncio.run(executor.execute("flaky2", {}))
     assert ok.ok is True
     assert executor.consecutive_failures["flaky2"] == 0
+
+
+def test_circuit_breaker_has_no_half_open_within_task(tmp_path):
+    """★ 本实现**没有 half-open（半开探测）**：熔断打开后本任务内不再调用该工具。
+
+    这是**有意的设计**（理由写在 `ToolExecutor` 的类 docstring 里）：
+    执行器的生命周期 == 一个任务（默认最多 6 步），熔断的目的就是
+    「别把本任务剩下的步数浪费在必然失败的调用上」；冷却后放一次探测，
+    在「依赖整个任务期间都是坏的」这种最常见情形下只是**多浪费一步**。
+    真要做 half-open，应该放在跨任务共享状态的长驻服务里。
+
+    本用例把这条约定**锁成回归测试**：熔断打开后，工具不会再被真正调用。
+    """
+    tool, state = make_tool("broken", fail_times=99, exc_factory=lambda: ConnectionError("refused"))
+    executor, _ = make_executor(
+        tmp_path, [tool],
+        retry={"max_attempts": 1, "backoff_base_s": 0.01},
+        circuit_breaker={"failure_threshold": 1},
+    )
+
+    first = asyncio.run(executor.execute("broken", {}))
+    calls_after_first = state["calls"]
+    second = asyncio.run(executor.execute("broken", {}))
+    third = asyncio.run(executor.execute("broken", {}))
+
+    assert first.ok is False
+    assert second.error_class == "circuit_open"
+    assert third.error_class == "circuit_open"
+    assert executor.breaker_open["broken"] is True
+    # ★ 熔断后不再真正调用（没有 half-open 探测）
+    assert state["calls"] == calls_after_first
+    # 熔断期间的这两次调用都算「没拿到结果」→ 计入 failed
+    assert executor.stats["failed"] == 3
+    assert executor.stats["calls"] == 3
 
 
 # ---------------- 超时 / 未知工具 ----------------

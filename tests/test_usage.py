@@ -29,6 +29,7 @@ from agent.usage import (  # noqa: E402
     load_pricing,
     price_for,
     scan_trace_dir,
+    summarize_tool_outcomes,
     summarize_usage,
 )
 from tests.fake_llm import ScriptedChatModel, tool_call  # noqa: E402
@@ -118,6 +119,35 @@ def test_format_usage_line_includes_numbers_and_cost():
     assert "步数=2" in line
 
 
+# ---------------- 1.5 工具结局口径（与 runner 的 metrics 同一套） ----------------
+
+
+def test_summarize_tool_outcomes_separates_degraded_from_failed():
+    """ok / degraded / failed 三类互斥；**降级成功算成功**。"""
+    events = [
+        {"type": "observation", "tool": "calculator", "ok": True, "degraded": False},
+        {"type": "observation", "tool": "search_knowledge", "ok": True, "degraded": True},
+        {"type": "observation", "tool": "search_knowledge", "ok": False, "degraded": False},
+        {"type": "observation", "tool": "nope", "ok": False, "degraded": False},
+        {"type": "llm_call", "ok": True},   # 非 observation 事件不算工具调用
+    ]
+    summary = summarize_tool_outcomes(events)
+    assert summary["tool_calls"] == 4
+    assert summary["tool_ok"] == 1
+    assert summary["tool_degraded"] == 1
+    assert summary["tool_failed"] == 2
+    assert summary["tool_succeeded"] == 2
+    # 成功率 = (ok + degraded) / calls；主通道健康度 = ok / calls
+    assert summary["tool_success_rate"] == 0.5
+    assert summary["tool_success_rate_main"] == 0.25
+
+
+def test_summarize_tool_outcomes_without_calls():
+    summary = summarize_tool_outcomes([{"type": "run_start"}])
+    assert summary["tool_calls"] == 0
+    assert summary["tool_success_rate"] is None
+
+
 # ---------------- 2. runner 集成 ----------------
 
 def _usage_message(text: str, in_tokens: int, out_tokens: int) -> AIMessage:
@@ -194,6 +224,30 @@ def test_run_task_without_usage_still_reports_tokens_zero(monkeypatch, tmp_path,
     assert "0 次有用量/1 次无用量" in out
 
 
+def test_trace_derived_tool_outcomes_match_runner_metrics(monkeypatch, tmp_path):
+    """★ 同一个事实源：从 trace 重算的工具口径必须与 runner 内存里的 metrics 完全一致。
+
+    否则会出现「跑的时候一个数、复盘时另一个数」——那指标就没法拿来判断问题。
+    """
+    first = tool_call("calculator", {"expression": "6*7"}, "call_1")
+    config = patch_env(monkeypatch, tmp_path, [first, AIMessage(content="42")])
+
+    result = asyncio.run(run_task("算一下 6*7", config=config))
+    events = [
+        json.loads(line)
+        for line in Path(result.trace_path).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    recomputed = summarize_tool_outcomes(events)
+
+    assert recomputed["tool_calls"] == result.metrics["tool_calls"] == 1
+    assert recomputed["tool_ok"] == result.metrics["tool_ok"] == 1
+    assert recomputed["tool_degraded"] == result.metrics["tool_degraded"] == 0
+    assert recomputed["tool_failed"] == result.metrics["tool_failed"] == 0
+    assert recomputed["tool_success_rate"] == result.metrics["tool_success_rate"] == 1.0
+    assert recomputed["tool_success_rate_main"] == result.metrics["tool_success_rate_main"] == 1.0
+
+
 # ---------------- 3. 累计层（扫 trace 求和） ----------------
 
 
@@ -231,6 +285,36 @@ def test_load_pricing_merges_config_overrides():
     assert pricing["deepseek-chat"]["output"] == 9.99
     assert pricing["deepseek-chat"]["input"] == 0.27   # 未覆盖的字段保留内置值
     assert pricing["my-model"] == {"input": 0.01, "output": 0.02}
+
+
+def test_aggregate_usage_also_aggregates_tool_outcomes(tmp_path):
+    """累计层也要能回答「这批运行里工具成功率是多少、降级了几次」。"""
+    path = tmp_path / "run_20260101-000001_run1.jsonl"
+    events = [
+        {"ts": 1, "run_id": "run1", "step": 0, "type": "run_start", "task": "任务1",
+         "llm": "model=demo-model base_url=http://x api_key=sk-****", "max_steps": 3},
+        {"ts": 2, "run_id": "run1", "step": 1, "type": "observation", "tool": "calculator", "ok": True, "degraded": False},
+        {"ts": 3, "run_id": "run1", "step": 1, "type": "observation", "tool": "search_knowledge", "ok": True, "degraded": True},
+        {"ts": 4, "run_id": "run1", "step": 1, "type": "observation", "tool": "search_knowledge", "ok": False, "degraded": False},
+        {"ts": 5, "run_id": "run1", "step": 1, "type": "run_end", "status": "completed", "steps": 1, "metrics": {}},
+    ]
+    path.write_text("\n".join(json.dumps(e, ensure_ascii=False) for e in events) + "\n", encoding="utf-8")
+
+    rows = scan_trace_dir(tmp_path, PRICING)
+    assert rows[0]["tool_calls"] == 3
+    assert rows[0]["tool_ok"] == 1
+    assert rows[0]["tool_degraded"] == 1
+    assert rows[0]["tool_failed"] == 1
+    assert rows[0]["tool_success_rate"] == round(2 / 3, 4)
+    assert rows[0]["tool_success_rate_main"] == round(1 / 3, 4)
+
+    total = aggregate_usage(rows)
+    assert total["total_tool_calls"] == 3
+    assert total["total_tool_ok"] == 1
+    assert total["total_tool_degraded"] == 1
+    assert total["total_tool_failed"] == 1
+    assert total["tool_success_rate"] == round(2 / 3, 4)
+    assert total["tool_success_rate_main"] == round(1 / 3, 4)
 
 
 # ---------------- 4. 评测侧聚合（沿用 eval_harness 风格） ----------------

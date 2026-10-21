@@ -12,8 +12,12 @@
 - 真正需要精确计费时，可在 `_message_chars()` 处替换成 tokenizer。
 
 配置：
-    agent.max_context_chars: 12000   # 字符预算
+    agent.max_context_chars: 12000   # 字符**目标预算**（不是硬上限，见 compress_messages 文档）
     agent.context_keep_last: 6       # 最近 N 条原样保留
+
+★ 预算是「目标」不是「上限」：压缩分三档预览逐级收紧，若三档用完仍然超预算，
+就返回尽力压缩后的结果，并把「超了多少」写进 stats（`over_budget` / `over_budget_chars`）——
+压不下来说得出来，而不是假装压住了（也不能删消息：删了会破坏协议配对）。
 """
 
 import json
@@ -95,10 +99,20 @@ def compress_messages(
     keep_last: int = 6,
     preview_chars: int = 120,
 ) -> Tuple[List[AnyMessage], Dict[str, Any]]:
-    """把历史消息压到字符预算内。
+    """把历史消息压到**字符目标预算**内。
+
+    ★ `max_chars` 是**目标预算（target budget）**，不是硬上限（hard cap）：
+    压缩有三档预览（`preview_chars` → `preview_chars//3` → 0），
+    每一档都会重新算一遍总字符数；**如果三档都用完仍然超预算**，
+    就带着「尽力压缩后仍然超预算」的结果返回（不能删消息 —— 删了会破坏
+    `tool_calls ↔ ToolMessage` 的协议配对）。
+    所以「压完还超」是**可感知**的：stats 里会给出
+    `over_budget`（是否超）/ `over_budget_chars`（超了多少）/ `budget_floor_hit`（是否已用尽三档）。
+    想要硬上限的场景请在调用方自己判断 `stats["over_budget"]`。
 
     返回 (compressed_messages, stats)。stats 可直接写入 trace：
-    before_chars / after_chars / compacted_messages / kept_messages / compressed。
+    before_chars / after_chars / compacted_messages / kept_messages / compressed /
+    over_budget / over_budget_chars / budget_floor_hit。
     """
     messages = list(messages)
     before = sum(_message_chars(message) for message in messages)
@@ -110,6 +124,10 @@ def compress_messages(
         "kept_messages": len(messages),
         "total_messages": len(messages),
         "max_chars": max_chars,
+        # 目标预算语义：默认 false / 0（没超预算、没用到底线）
+        "over_budget": False,
+        "over_budget_chars": 0,
+        "budget_floor_hit": False,
     }
 
     if before <= max_chars or len(messages) <= keep_last + 1:
@@ -124,6 +142,9 @@ def compress_messages(
         compacted = head + [_compact(message, preview) for message in middle] + tail
         after = sum(_message_chars(message) for message in compacted)
         if after <= max_chars or preview == 0:
+            # ★ 走到这里可能仍然超预算（preview==0 那一档是「尽力而为」的下限）：
+            #   明确记下来，别让「压过了」看起来像「压进预算了」。
+            over = max(0, after - max_chars)
             stats.update(
                 {
                     "compressed": True,
@@ -132,6 +153,9 @@ def compress_messages(
                     "kept_messages": len(head) + len(tail),
                     "total_messages": len(compacted),
                     "preview_chars": preview,
+                    "over_budget": over > 0,
+                    "over_budget_chars": over,
+                    "budget_floor_hit": over > 0 and preview == 0,
                 }
             )
             return compacted, stats

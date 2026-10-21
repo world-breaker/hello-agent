@@ -9,6 +9,8 @@
 trace 里已经有 `run_start.llm`（模型名）与每条 `llm_call.usage`，所以成本**任何时刻都能重算**——
 换单价表、复查某次为什么贵、把某次运行摘出来单独算，都只依赖已经落盘的 JSONL，
 不会出现「账本和 trace 对不上」的问题。累计值 = 目录里所有 run 的和（想只看某段时间就换目录/过滤文件名）。
+工具结局同理：每条 `observation` 事件带 `ok` / `degraded`，所以**工具成功率也能离线重算**
+（口径见 README §5.1：ok / degraded / failed 三类互斥，成功率 = (ok + degraded) / calls）。
 """
 
 import argparse
@@ -32,6 +34,16 @@ def render_markdown(rows, total) -> str:
     lines.append(f"- 平均每条任务：**{total['avg_tokens_per_run']} tokens**"
                  f" / **${total['avg_cost_per_run_usd']}**")
     lines.append(f"- 累计估算成本：**${total['total_cost_usd']}**（{PRICING_UNIT}）")
+    # 工具结局：ok / degraded / failed 三类互斥；成功率把「降级成功」算作成功
+    lines.append(
+        f"- 工具调用：**{total['total_tool_calls']}** 次"
+        f"（主通道成功 {total['total_tool_ok']} / 降级成功 {total['total_tool_degraded']} / "
+        f"失败 {total['total_tool_failed']}）"
+    )
+    lines.append(
+        f"- 工具成功率（(ok+degraded)/calls）：**{total['tool_success_rate']}**"
+        f"（主通道健康度 ok/calls = {total['tool_success_rate_main']}）"
+    )
     if total.get("note"):
         lines.append(f"- 注意：{total['note']}")
     lines.append("")
@@ -73,6 +85,17 @@ def main() -> int:
     print("-" * 100)
     print(f"累计：{total['runs']} 次运行，{total['total_tokens']} tokens，"
           f"估算成本 ${total['total_cost_usd']}（{total['runs_with_pricing']} 次命中单价表）")
+    # 工具结局（口径与 README §5.1 一致）：ok / degraded / failed 三类互斥，
+    # 成功率 = (ok + degraded) / calls —— **降级成功算成功**，主通道健康度单列。
+    print(
+        f"工具调用：{total['total_tool_calls']} 次"
+        f"（主通道成功 {total['total_tool_ok']} / 降级成功 {total['total_tool_degraded']} / "
+        f"失败 {total['total_tool_failed']}）"
+    )
+    print(
+        f"工具成功率（含降级成功）={total['tool_success_rate']}，"
+        f"主通道健康度（ok/calls）={total['tool_success_rate_main']}"
+    )
     if total.get("note"):
         print(f"注意：{total['note']}")
 

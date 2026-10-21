@@ -9,6 +9,18 @@
 | **重试仍失败**（exhausted） | 依赖长时间不可用 | **降级**：调用该工具注册的 fallback（如 RAG 的进程内直连检索）；没有 fallback 就返回「明确失败 + 可选出路」 |
 | **同一工具连续失败**（熔断） | 依赖彻底坏了 | **本任务内临时禁用该工具**，在 observation 里告知模型不要再调，避免把步数浪费在必然失败的调用上 |
 
+★ **一次工具调用的三种结局是互斥的**（`stats` 的口径，README §5.1 有同一份说明）：
+
+| 结局 | 含义 | 计入 |
+|---|---|---|
+| `ok` | 主通道成功 | `stats["ok"]` |
+| `degraded` | **降级成功**：主通道坏了、fallback 成功，调用方**真的拿到了可用结果** | `stats["degraded"]` |
+| `failed` | 最终失败，没拿到结果 | `stats["failed"]` |
+
+不变式：`calls == ok + degraded + failed`（三类互斥、穷尽）。
+**成功率 = (ok + degraded) / calls**：降级成功**算成功**（调用方拿到了结果），
+同时它被单独记在 `degraded` 里，便于区分「主通道健康度」与「整体可用率」。
+
 另外两条硬约束：
 - **超时**：每次工具调用都有 `asyncio.wait_for` 超时，防止一个卡死的工具把整个任务拖死；
 - **输出长度上限**：工具结果会直接进模型上下文，超长结果截断（截断处标注），把「上下文成本」握在自己手里。
@@ -105,7 +117,20 @@ def classify_error(exc: Exception, retryable_patterns: List[str]) -> str:
 
 
 class ToolExecutor:
-    """带重试/降级/熔断的工具执行器（每个任务一个实例，熔断状态不跨任务）。"""
+    """带重试/降级/熔断的工具执行器（每个任务一个实例，熔断状态不跨任务）。
+
+    ★ **本实现没有 half-open（半开探测）**：熔断一旦打开，该工具在**本任务内**不再被调用。
+    理由（为什么这是有意的设计，而不是漏做）：
+    - 执行器的生命周期 == 一个任务（`max_steps` 默认 6 步），熔断的目的就是
+      「别把本任务剩下的步数浪费在必然失败的调用上」；冷却后放一次探测，
+      最好的情况是白赚一次调用，最坏的情况是**再浪费一步**（依赖通常在整个任务期间都是坏的）；
+    - 「依赖恢复了」这件事在本任务内本来就用不上：任务结束就换新执行器、
+      熔断状态不跨任务，下次任务自然是一次全新的探测；
+    - 真要做 half-open，应该放在**跨任务共享状态的长驻服务**里（那才有「冷却窗口」的意义），
+      而不是放在这个「一个任务一个实例」的执行器里。
+
+    所以这里的熔断是**任务内止损开关**，不是分布式熔断器 —— 名字与文档都按这个口径写。
+    """
 
     def __init__(
         self,
@@ -130,7 +155,12 @@ class ToolExecutor:
 
         self.consecutive_failures: Dict[str, int] = {}
         self.breaker_open: Dict[str, bool] = {}
-        self.stats = {"calls": 0, "ok": 0, "failed": 0, "retries": 0, "degraded": 0, "circuit_opens": 0}
+        # ★ 口径：ok / degraded / failed 三类**互斥**，且 ok + degraded + failed == calls。
+        #   ok       = 主通道成功
+        #   degraded = 降级成功（主通道坏、fallback 好）——调用方拿到了可用结果
+        #   failed   = 最终失败，没拿到结果
+        # 成功率 = (ok + degraded) / calls（降级成功算成功，但单独计数以便看主通道健康度）。
+        self.stats = {"calls": 0, "ok": 0, "degraded": 0, "failed": 0, "retries": 0, "circuit_opens": 0}
 
     # ---------- 对外入口 ----------
 
@@ -155,6 +185,8 @@ class ToolExecutor:
             return outcome
 
         if self.breaker_open.get(name):
+            # ★ 没有 half-open：熔断打开后本任务内不再调用该工具（理由见类 docstring）。
+            #   这里计一次 failed（本次调用没有拿到任何结果），与 trace 里的一条 observation 对应。
             self.stats["failed"] += 1
             outcome = ToolOutcome(
                 ok=False,
@@ -227,13 +259,16 @@ class ToolExecutor:
 
         # ---- 重试耗尽：熔断计数 + 尝试降级 ----
         self._on_failure(name)
-        self.stats["failed"] += 1
 
         if name in self.fallbacks:
             self.tracer.event("degrade", tool=name, reason=f"重试 {attempts} 次仍失败：{last_error}")
             try:
                 raw = await asyncio.wait_for(self._call_fallback(name, args), timeout=self.timeout_s)
                 text = self._stringify(raw)
+                # ★ 降级成功 = 第三种结局（degraded）：调用方拿到了可用结果。
+                #   注意这里**不**加 stats["failed"] —— 早先的实现先把 failed 加了、
+                #   降级成功时又不加 ok，于是「降级成功」被算成失败，成功率口径自相矛盾。
+                #   现在三类互斥：ok + degraded + failed == calls。
                 self.stats["degraded"] += 1
                 self._on_success(name)  # 降级成功 → 重置该工具的连续失败计数
                 outcome = ToolOutcome(
@@ -250,6 +285,8 @@ class ToolExecutor:
             except Exception as exc:  # noqa: BLE001
                 self.tracer.event("degrade", tool=name, reason=f"降级路径同样失败：{type(exc).__name__}: {exc}")
 
+        # 主通道与降级通道都没成 → 这才是真正的失败（failed）
+        self.stats["failed"] += 1
         outcome = ToolOutcome(
             ok=False,
             tool=name,

@@ -76,7 +76,11 @@ memory:
   inject_top_k: 3          # 任务启动时按 BM25 召回、自动注入 system prompt 的条数
   max_inject_chars: 800    # 注入文本上限（控制上下文成本）
   max_content_chars: 2000  # 单条记忆长度上限
-  max_records: 2000        # 超过后自动 compact（同 key 只留最新）
+  # ★ compact_threshold：JSONL **文件行数**超过它就重写文件（同 key 只留最新）。
+  #   它**不是**「最多存多少条记录」—— 不同 key 的记录条数不受它限制。
+  #   （旧名 max_records 名不副实，已改名；旧配置仍可用，会给一条告警。）
+  compact_threshold: 2000
+  ttl_seconds: 0           # 记忆默认存活秒数（0 = 永不过期；过期记录不参与召回）
 
 trace:
   dir: "./traces"         # 每次任务一个 JSONL 文件

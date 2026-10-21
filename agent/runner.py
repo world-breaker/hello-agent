@@ -58,11 +58,24 @@ def _text_of(message: AnyMessage) -> str:
 
 
 def _summarize_metrics(tracer: Tracer, executor: ToolExecutor) -> Dict[str, Any]:
-    """从 trace 事件里聚合本次运行的指标（可直接用于「工具调用成功率 / 平均步数」统计）。"""
+    """从 trace 事件里聚合本次运行的指标（可直接用于「工具调用成功率 / 平均步数」统计）。
+
+    ★ 工具结局口径（与 `agent/usage.py:summarize_tool_outcomes` 同口径，两者必须能对上）：
+      - `tool_ok`       主通道成功
+      - `tool_degraded` 降级成功（主通道坏、fallback 好）——调用方拿到了可用结果
+      - `tool_failed`   最终失败，没拿到结果
+      三类互斥且穷尽：`tool_ok + tool_degraded + tool_failed == tool_calls`。
+      - `tool_success_rate`      = (ok + degraded) / calls —— **降级成功算成功**
+      - `tool_success_rate_main` = ok / calls —— 只看主通道的健康度
+    """
     counts: Dict[str, int] = {}
     for event in tracer.events:
         counts[event["type"]] = counts.get(event["type"], 0) + 1
     tool_calls = executor.stats["calls"]
+    tool_ok = executor.stats["ok"]
+    tool_degraded = executor.stats["degraded"]
+    tool_failed = executor.stats["failed"]
+    tool_succeeded = tool_ok + tool_degraded
 
     # 上下文压缩：记录压缩次数、最大节省字符数、最近一次的 before/after
     context_events = [event for event in tracer.events if event["type"] == "context_compressed"]
@@ -73,18 +86,26 @@ def _summarize_metrics(tracer: Tracer, executor: ToolExecutor) -> Dict[str, Any]
         ),
         default=0,
     )
+    # ★ 压完仍然超预算的次数：max_context_chars 是**目标预算**而不是硬上限（见 agent/context.py），
+    #   压不到预算时要能从指标上看出来，而不是假装压住了。
+    context_over_budget = sum(
+        1 for event in context_events if event.get("over_budget")
+    )
 
     return {
         "llm_calls": counts.get("thought", 0),
         "tool_calls": tool_calls,
-        "tool_ok": executor.stats["ok"],
-        "tool_failed": executor.stats["failed"],
+        "tool_ok": tool_ok,
+        "tool_degraded": tool_degraded,
+        "tool_failed": tool_failed,
+        "tool_succeeded": tool_succeeded,
         "tool_retries": executor.stats["retries"],
-        "tool_degraded": executor.stats["degraded"],
         "circuit_opens": executor.stats["circuit_opens"],
-        "tool_success_rate": round(executor.stats["ok"] / tool_calls, 4) if tool_calls else None,
+        "tool_success_rate": round(tool_succeeded / tool_calls, 4) if tool_calls else None,
+        "tool_success_rate_main": round(tool_ok / tool_calls, 4) if tool_calls else None,
         "context_compressions": len(context_events),
         "context_saved_chars": context_saved,
+        "context_over_budget": context_over_budget,
         "context_last_before_chars": context_events[-1].get("before_chars") if context_events else None,
         "context_last_after_chars": context_events[-1].get("after_chars") if context_events else None,
         "event_counts": counts,

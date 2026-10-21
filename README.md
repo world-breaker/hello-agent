@@ -16,7 +16,7 @@
 
 | 项目 | 事实 | 证据位置 |
 |---|---|---|
-| 离线测试 | `130 passed / 1 skipped`（MCP 端到端测试用环境变量开启，全开为 `131 passed`） | §7 |
+| 离线测试 | `151 passed / 1 skipped`（MCP 端到端测试用环境变量开启，全开为 `152 passed`） | §7 |
 | 评测集 | `data/eval_queries.json` **50 条**带 ground truth（工具期望 / 该不该拒答 / 答案要点 / 幻觉陷阱） | §5.9 |
 | 压缩代价 | 压缩开 / 关同任务对照：上下文省 29.3%，代价是答案要点命中率 0.758→0.613、工具参数被压坏 5 次（**假模型**，未测语义质量） | §5.6.1 |
 | 真实任务 | 三条 demo 全部 `status=completed`（步数 3 / 4 / 2，总耗时 30.97s） | §1 |
@@ -320,6 +320,47 @@ copy .env.example .env
 再按关键词命中表（timeout / connection / rate limit / 429 / 502 / 503 / 504 → retryable），
 **未知异常一律按 retryable**（「多试一次」的代价远小于「直接放弃」）。
 
+#### 5.1.1 工具结局的三分类与「成功率」口径（**别读错这个数**）
+
+一次工具调用恰好落一条 `observation` 事件，结局**互斥且穷尽**：
+
+| 结局 | 含义 | 计入 |
+|---|---|---|
+| `ok` | **主通道**成功 | `tool_ok` |
+| `degraded` | **降级成功**：主通道坏了、fallback 成功 —— 调用方**真的拿到了可用结果** | `tool_degraded` |
+| `failed` | 最终失败，没拿到结果（参数错 / 重试耗尽且无 fallback / 熔断拒调 / 工具不存在） | `tool_failed` |
+
+不变式：`tool_ok + tool_degraded + tool_failed == tool_calls`（三类互斥、穷尽）。
+
+**成功率（`tool_success_rate`）的定义**：
+
+```
+tool_success_rate      = (tool_ok + tool_degraded) / tool_calls   ← 分母是「工具调用总数」
+tool_success_rate_main = tool_ok / tool_calls                     ← 只看主通道的健康度
+```
+
+- **降级成功算成功**：调用方拿到的是可用结果，任务也确实往下走了 —— 把它算成失败会低估可用性；
+- 但它**单独记在 `tool_degraded` 里**：所以「主通道是不是健康」看 `tool_success_rate_main`，
+  「整体可用率」看 `tool_success_rate`。两个数一起看才知道是「依赖挂了但有兜底」还是「真挂了」。
+
+> ★ 这里修过一个自相矛盾的口径：早先的实现进降级分支前就把 `failed` 加了，
+> 降级成功时既不加 `ok` 也不减 `failed` → 「降级成功」被算成失败（成功率直接变 0），
+> 而且 `ok + failed` 还大于 `tool_calls`（分母都不自洽了）。
+> 现在三类互斥，`agent/runner.py` 的 metrics 与 `agent/usage.py:summarize_tool_outcomes()`
+> （从 trace 离线重算）用的是**同一套口径**，两个地方的数字必然对得上。
+
+#### 5.1.2 熔断**没有 half-open**（有意的设计，不是漏做）
+
+熔断一旦打开，该工具在**本任务内**不再被调用（`execute()` 直接返回 `circuit_open` 拒调）。
+
+- **为什么不做 half-open**：执行器的生命周期 == 一个任务（默认最多 6 步），
+  熔断的目的就是「别把本任务剩下的步数浪费在必然失败的调用上」。
+  冷却后放一次探测，在「依赖整个任务期间都是坏的」（最常见的情形）下只是**多浪费一步**；
+- **「依赖恢复了」在本任务内用不上**：任务结束就换新执行器、熔断状态不跨任务，
+  下次任务自然是一次全新的尝试；
+- 真要做 half-open（冷却窗口 + 半开探测），应该放在**跨任务共享状态的长驻服务**里 ——
+  那才有「冷却窗口」的意义。回归测试见 `tests/test_resilience.py::test_circuit_breaker_has_no_half_open_within_task`。
+
 ### 5.2 三条硬约束
 
 - **单次工具超时 20s**（`asyncio.wait_for`）：一个卡死的工具不能拖死整个任务；
@@ -415,6 +456,13 @@ agent:
 | **BM25 召回（英文词 + 中文单字/二元组）** | 比「词重叠比例」更合理：idf 让稀有词（项目名/术语）权重更高，`b` 做文档长度归一化；零依赖、可解释、离线可跑。`recall_mode: "overlap"` 可切回旧算法做 A/B |
 | **只注入命中的 top-k** | 与任务无关键词重叠就不注入，避免把无关记忆塞进 prompt |
 | **拒绝疑似密钥** | 记忆是长期落盘的，`API_KEY=` / 形似 `sk-…` 的串直接拒绝，避免把密钥写进磁盘。判定按**形状**（`sk-` + ≥16 位字母数字）而不是子串 —— 否则 `risk-based` / `disk-based` 这类正常英文词会被整条误拒 |
+| **能写就能删**（`forget(key)`） | 记忆错了要能删；JSONL 是追加写，删除 = 重写文件（几百~几千条的量级，重写成本可接受） |
+| **能过期**（`ttl_seconds`） | 「上次的临时约定」不该永久生效；过期记录**不参与召回**，加载时顺手清掉 |
+| **来源 + 核验**（`source` / `verified`） | 「模型说过」与「这条事实被核对过」是两件事：`verified` 默认 `False`，召回可用 `only_verified=True` 只取已核验的 |
+
+★ **召回的 key 加权是「子串包含」，不是「精确命中」**：实现是 `record.key.lower() in query_lower`，
+所以 key=`pre` 会被 query=`preference …` 命中（注释与实现曾经不一致，现已按实现改正，
+并有回归测试锁住这条语义）。
 
 配置（`config.yaml`）：
 
@@ -429,8 +477,16 @@ memory:
   inject_top_k: 3             # 任务启动自动注入的条数
   max_inject_chars: 800       # 注入长度上限（控上下文成本）
   max_content_chars: 2000
-  max_records: 2000           # 超过后自动 compact（同 key 只留最新）
+  compact_threshold: 2000     # JSONL 文件行数超过它就重写文件（同 key 只留最新）
+  ttl_seconds: 0              # 记忆默认存活秒数（0 = 永不过期）
 ```
+
+> ⚠️ **`compact_threshold`（旧名 `max_records`）不是「最多存多少条记录」**：
+> 它的真实语义是「**JSONL 文件的行数**超过它就重写文件（同 key 只留最新）」——
+> 也就是「追加写攒下的重复行攒到多少就合并一次」。
+> **不同 key 的记录条数不受它限制**（写 10 条不同 key 的记忆，文件里仍是 10 行）。
+> 旧名容易被读成容量上限，所以改名；**旧配置文件继续可用**
+> （读到 `max_records` 时按旧值生效，并给一条 `DeprecationWarning` 提醒改名）。
 
 **为什么从「词重叠」升级到 BM25（有对照数据）**：
 构造两条命中同一组关键词、只差文档长度的记忆——短记忆「数据库 配置」 vs
@@ -451,8 +507,9 @@ BM25 的文档长度归一化让「短而精确」的记忆胜出；这在记忆
 ```
 
 输出会展示：任务 A 写入 2 条记忆 → 任务 B 自动召回并拼出注入文本 → 无关问题不注入。
-单元测试见 `tests/test_memory.py`（11 条：持久化、同 key 覆盖、拒绝密钥、无重叠不召回、工具往返、
-注入截断、禁用、BM25 标注集 Recall@1=6/6、overlap 模式可回退、BM25 分数为正、长度归一化对照）。
+单元测试见 `tests/test_memory.py`（21 条：持久化、同 key 覆盖、拒绝密钥、无重叠不召回、工具往返、
+注入截断、禁用、BM25 标注集 Recall@1=6/6、overlap 模式可回退、BM25 分数为正、长度归一化对照，
+以及 key 子串加权、`compact_threshold` 语义与旧键名兼容、删除 / 过期 / 来源 / 核验、旧格式文件仍可加载）。
 
 ### 5.6 上下文压缩（字符预算）
 
@@ -467,13 +524,13 @@ BM25 的文档长度归一化让「短而精确」的记忆胜出；这在记忆
 - **字符预算**：`max_context_chars` 是 token 的保守代理（中文约 1 字 ≈ 1 token）；
   超预算时先按 `preview_chars` 压缩，再逐步收紧。
 - **可观测**：trace 记 `context_compressed`（before/after/compacted/kept）；
-  `RunResult.metrics` 增加 `context_saved_chars` / `context_compressions`。
+  `RunResult.metrics` 增加 `context_saved_chars` / `context_compressions` / `context_over_budget`。
 
 配置：
 
 ```yaml
 agent:
-  max_context_chars: 12000   # 送模型前的字符预算
+  max_context_chars: 12000   # 送模型前的字符**目标预算**
   context_keep_last: 6       # 最近 N 条原样保留
 ```
 
@@ -482,6 +539,20 @@ agent:
 
 > 为什么不用 LLM 做摘要：摘要会额外调用模型（成本 + 不确定性），且单测不可复现；
 > 当前用确定性压缩，LLM 摘要留作后续可选项。
+
+★ **`max_context_chars` 是「目标预算」，不是硬上限**：压缩分三档预览
+（`preview_chars` → `preview_chars//3` → 0）逐级收紧；若三档都用完**仍然超预算**，
+就返回尽力压缩后的结果（不能删消息 —— 删了会破坏协议配对）。
+所以「压完还超」是**可感知**的，不会被悄悄吞掉：
+
+| stats 字段 | 含义 |
+|---|---|
+| `over_budget` | 压完是否仍然超出目标预算（bool） |
+| `over_budget_chars` | 超出多少字符（`after_chars - max_chars`） |
+| `budget_floor_hit` | 三档预览是否已用尽（= 已经尽力了，再压就要动协议骨架了） |
+
+`RunResult.metrics` 里也有 `context_over_budget`（本次运行压了几次仍然超预算），
+trace 的 `context_compressed` 事件同样带这三个字段 → 复盘时能直接看出「这次压没压住」。
 
 #### 5.6.1 压缩的**代价**：同任务开 / 关对照实验（`experiments/`）
 
@@ -532,6 +603,11 @@ agent:
 |---|---|---|
 | 单任务 | 这一次运行累加的 in/out tokens、模型调用次数（有用量/无用量分别计） | `run_end.metrics["usage"]`、控制台一行摘要 |
 | 累计 | 扫 `traces/*.jsonl` 重算并求和（次数、总 token、平均、总成本） | `scripts/usage_report.py`（可导出 json/md） |
+
+★ **工具结局也走同一套「trace 是事实源」的玩法**：`summarize_tool_outcomes(events)` 是纯函数，
+直接读 trace 里的 `observation` 事件重算 `ok / degraded / failed` 与成功率（口径见 §5.1.1），
+`scripts/usage_report.py` 会把「主通道成功 / 降级成功 / 失败」与两个成功率一起打出来 ——
+所以「这批运行里工具成功率多少、降级了几次」也能离线复盘，不用重新跑。
 
 三个刻意的取舍：
 
@@ -809,7 +885,7 @@ ground truth 标注，口径与诚实率**完全一致**（分母只算 `status=
 | `thought` | 模型这一轮的文本 + 请求的工具调用列表 |
 | `action` | 发起一次工具调用（含 `attempt` 序号；重试会出现多条） |
 | `retry` | 一次可重试失败 + 退避秒数 |
-| `observation` | 工具结果：成功给截断预览；失败给 `error_class` 与可操作建议 |
+| `observation` | 工具结果：成功给截断预览；失败给 `error_class` 与可操作建议（**带 `ok` / `degraded` → 工具口径可离线重算**） |
 | `degrade` / `circuit_open` | 降级 / 熔断触发 |
 | `max_steps_reached` / `run_end` | 收尾：状态、步数（含 `steps_this_run`）、最终回答、指标（`tool_success_rate`、`usage` 用量与成本） |
 
@@ -824,11 +900,17 @@ ground truth 标注，口径与诚实率**完全一致**（分母只算 `status=
 {"ts": 1792128145.825, "run_id": "3941a1d2", "step": 1, "type": "run_end", "status": "max_steps_exceeded", "steps": 1, "elapsed_ms": 7135.98, "metrics": {"llm_calls": 1, "tool_calls": 0, "tool_ok": 0, "tool_failed": 0, "tool_retries": 0, "tool_degraded": 0, "circuit_opens": 0, "tool_success_rate": null}}
 ```
 
+> ▸ 上面这段是 2026-10-16 那次真实运行的原文（metrics 字段集**之后又长过**）：
+> 现在还有 `tool_succeeded` / `tool_success_rate_main`（工具口径，见 §5.1.1）
+> 与 `context_over_budget`（压缩是否压住预算，见 §5.6）。
+
 三条工程纪律：
 
 1. **密钥永不落盘**：所有字符串过 `mask_secret()`，trace 里只有 `sk-****`；有测试用例守着（`test_trace_never_leaks_api_key`）；
-2. **指标现成可聚合**：`run_end.metrics` 里已有 `tool_calls / tool_ok / tool_failed / tool_retries / tool_degraded / circuit_opens / tool_success_rate / event_counts`
+2. **指标现成可聚合**：`run_end.metrics` 里已有 `tool_calls / tool_ok / tool_degraded / tool_failed / tool_succeeded / tool_retries / circuit_opens / tool_success_rate / tool_success_rate_main / context_over_budget / event_counts`
    以及 `usage`（token 与估算成本，见 §5.7）、`thread_id / resumed / steps_this_run`（见 §5.8）——后续做「工具选择正确率 / 平均步数 / 单任务成本」评测时直接复用；
+   ★ 工具口径还能**离线重算**：`agent/usage.py:summarize_tool_outcomes()` 直接读 trace 里的 `observation` 事件，
+   与 runner 内存里的 metrics 是同一套口径（`scripts/usage_report.py` 已接上）；
 3. **控制台与文件分离**：控制台只打摘要（每条截断 200 字符），文件保留完整事件；`--console quiet|summary|verbose` 可切换。
 
 ---
@@ -839,8 +921,10 @@ ground truth 标注，口径与诚实率**完全一致**（分母只算 `status=
 
 ```text
 > .venv\Scripts\python.exe -m pytest -q
-........................................................................s......................          [100%]
-130 passed, 1 skipped in 31.98s
+........................................................................ [ 47%]
+....................................s................................... [ 94%]
+........                                                                 [100%]
+151 passed, 1 skipped in 20.26s
 ```
 
 把 MCP 端到端用例也打开（它会拉起 rag-mcp-server 子进程并加载 BGE 模型，约 10s）：
@@ -848,13 +932,14 @@ ground truth 标注，口径与诚实率**完全一致**（分母只算 `status=
 ```text
 > set HELLO_AGENT_TEST_MCP=1
 > .venv\Scripts\python.exe -m pytest -q
-........................................................................ [ 75%]
-..............................................................          [100%]
-131 passed in 30.44s
+........................................................................ [ 47%]
+........................................................................ [ 94%]
+........                                                                 [100%]
+152 passed in 25.38s
 
 > .venv\Scripts\python.exe -m pytest -q -k mcp_form     # 只跑那一条
 .                                                                        [100%]
-1 passed, 130 deselected in 12.39s
+1 passed, 151 deselected in 9.13s
 ```
 
 **测试怎么测一个「概率性系统」**：把模型替换成**脚本化假模型** `tests/fake_llm.py`
@@ -865,12 +950,14 @@ ground truth 标注，口径与诚实率**完全一致**（分母只算 `status=
 |---|---|
 | `tests/test_calculator.py` | 四则运算、白名单函数、**注入/危险表达式必须被拒**、超长表达式、返回值契约 |
 | `tests/test_graph.py` | 一步直答就结束 / 工具调用后继续 / **步数用尽被拦** / 工具失败回灌后恢复 / 幻觉工具不破坏循环 / 熔断后不再调用 |
-| `tests/test_resilience.py` | 失败分类、可重试→重试成功、permanent 不重试、重试耗尽的可操作提示、fallback 生效、熔断开/复位、超时强制、MCP 内容块解包 |
+| `tests/test_resilience.py` | 失败分类、可重试→重试成功、permanent 不重试、重试耗尽的可操作提示、fallback 生效、**降级成功不再被算成失败（ok/degraded/failed 三类互斥）**、熔断开/复位、**熔断无 half-open（本任务内不再调用）**、超时强制、MCP 内容块解包 |
 | `tests/test_runner.py` | 完成态的 trace 与指标、`max_steps_exceeded` 的说明文案、缺 `.env` 时的可读报错 |
 | `tests/test_trace.py` | JSONL 字段完整、**密钥不泄漏**、控制台预览截断、一次任务一个文件 |
 | `tests/test_rag_tool.py` | direct 形态契约、fallback 契约、auto 降级、**MCP 端到端**（需环境变量） |
-| `tests/test_usage.py` | 单价查表与成本换算**精确值**、usage 抽取（`usage_metadata` / `response_metadata` 两条来源）、无用量时明示、runner 里 token/成本落 metrics 与控制台摘要、扫 trace 求和（累计层）、评测侧聚合成本 |
+| `tests/test_context.py` | 未超预算不动手、压缩不破坏协议配对、幂等、**压不下来说得出来（over_budget / over_budget_chars / budget_floor_hit）** |
+| `tests/test_usage.py` | 单价查表与成本换算**精确值**、usage 抽取（`usage_metadata` / `response_metadata` 两条来源）、无用量时明示、runner 里 token/成本落 metrics 与控制台摘要、扫 trace 求和（累计层）、评测侧聚合成本、**工具结局离线重算与 runner 指标同口径** |
 | `tests/test_checkpoint_resume.py` | **续跑不重放已完成步骤**（sqlite 与自研 JSONL 两个后端同一套断言）、已收尾 thread 开新一轮、不给 thread_id 时完全不启用、显式 sqlite 缺依赖要报错而 auto 才允许降级、JSONL 落盘跨实例回读 |
+| `tests/test_memory.py` | 持久化 / 同 key 覆盖 / 拒绝密钥 / 无重叠不召回 / 工具往返 / 注入截断 / BM25 Recall@1=6/6、**key 子串加权**、**`compact_threshold` 语义与旧键名兼容**、**删除 / 过期 / 来源 / 核验**、**旧格式 JSONL 仍可加载** |
 
 ### CI 门禁（`.github/workflows/ci.yml`）
 
@@ -903,9 +990,9 @@ python -m pip install -r requirements.txt && python -m pytest -q -rs
 ```
 
 ```text
-# 本机（存在兄弟仓库 rag-mcp-server + BGE 缓存）：130 passed, 1 skipped in 31.98s
-# 本机 + HELLO_AGENT_TEST_MCP=1（把 MCP 端到端也打开）：131 passed in 30.44s
-# runner 上不存在兄弟仓库（= GitHub runner 的真实情形）：126 passed, 5 skipped in 4.69s
+# 本机（存在兄弟仓库 rag-mcp-server + BGE 缓存）：151 passed, 1 skipped in 20.26s
+# 本机 + HELLO_AGENT_TEST_MCP=1（把 MCP 端到端也打开）：152 passed in 25.38s
+# runner 上不存在兄弟仓库（= GitHub runner 的真实情形）：147 passed, 5 skipped in 5.05s
 #   —— 5 个集成用例走测试自带的 skipif 显式跳过（不是失败），见 tests/test_rag_tool.py
 ```
 
@@ -994,7 +1081,7 @@ hello-agent/
 │   │   ├── run_experiment.py  #     实验 runner（多档位 × 多任务，产出 csv/json/md）
 │   │   └── fake_policy_model.py #    上下文忠实的脚本化假模型（复用 tests/fake_llm.py）
 │   └── results/               #   实测产物：csv（逐任务原始数据）+ json + md（曲线报告）
-├── tests/                     # 130 passed / 1 skipped（+35：评测打分口径 21 + 压缩实验纯逻辑 14；MCP 端到端需设环境变量）
+├── tests/                     # 151 passed / 1 skipped（+35：评测打分口径 21 + 压缩实验纯逻辑 14；MCP 端到端需设环境变量）
 │                              #   checkpoint / 演示产物落 data/ 已 gitignore
 ├── traces/                    # 真实运行 trace（JSONL，可回放）
 └── docs/

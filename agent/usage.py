@@ -3,8 +3,8 @@
 设计取舍（README §5.7 有对应说明）：
 - **只加一层薄封装，不另起一套指标**：数字最终并进既有的 `run_end.metrics["usage"]`
   与 JSONL trace 的 `llm_call.usage`，和 `tool_calls / tool_success_rate` 一个口径；
-- **事实源是 trace，不是内存状态**：`summarize_usage(events)` 是纯函数，
-  复盘时可以直接对 `traces/*.jsonl` 重算（`scripts/usage_report.py` 就是这么做的），
+- **事实源是 trace，不是内存状态**：`summarize_usage(events)` / `summarize_tool_outcomes(events)`
+  都是纯函数，复盘时可以直接对 `traces/*.jsonl` 重算（`scripts/usage_report.py` 就是这么做的），
   所以「累计」不需要额外持久化，也就不存在账本与 trace 对不上的问题；
 - **算不出价就只报 token，绝不编数**：单价表是配置项（`config.yaml → llm.pricing`，按模型名匹配），
   没命中就返回 `estimated_cost_usd = None`，并在控制台明确写「未配置单价」；
@@ -164,6 +164,49 @@ def summarize_usage(
     return summary
 
 
+def summarize_tool_outcomes(events: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
+    """纯函数：把 trace 里的工具结局聚合成「这次运行」的工具口径指标。
+
+    为什么放在这里：和 token 用量一样，**事实源是 trace** —— 每次 `ToolExecutor.execute()`
+    都会落一条 `observation` 事件（带 `ok` / `degraded` 字段），
+    所以工具成功率也能事后对 `traces/*.jsonl` 重算，不必额外记账本。
+    口径必须与 `agent/runner.py:_summarize_metrics` 完全一致，否则两处数字对不上。
+
+    ★ 三种结局互斥且穷尽（一次调用恰好落一条 observation）：
+    - `tool_ok`       主通道成功
+    - `tool_degraded` **降级成功**：主通道坏、fallback 好 —— 调用方真的拿到了可用结果
+    - `tool_failed`   最终失败，没拿到结果
+
+    不变式：`tool_ok + tool_degraded + tool_failed == tool_calls`。
+    - `tool_success_rate`      = (ok + degraded) / calls —— **降级成功算成功**
+    - `tool_success_rate_main` = ok / calls —— 只看主通道健康度
+    """
+    calls = 0
+    ok = 0
+    degraded = 0
+    failed = 0
+    for event in events:
+        if event.get("type") != "observation":
+            continue
+        calls += 1
+        if not event.get("ok"):
+            failed += 1
+        elif event.get("degraded"):
+            degraded += 1
+        else:
+            ok += 1
+    succeeded = ok + degraded
+    return {
+        "tool_calls": calls,
+        "tool_ok": ok,
+        "tool_degraded": degraded,
+        "tool_failed": failed,
+        "tool_succeeded": succeeded,
+        "tool_success_rate": round(succeeded / calls, 4) if calls else None,
+        "tool_success_rate_main": round(ok / calls, 4) if calls else None,
+    }
+
+
 def format_usage_line(usage: Dict[str, Any], extra: str = "") -> str:
     """一次运行结束时打印的那一行摘要（tokens in/out、估算成本、步数…）。"""
     if not usage:
@@ -227,6 +270,7 @@ def scan_trace_dir(trace_dir: str | Path, pricing: Dict[str, Dict[str, float]] |
             continue
         model = model_from_trace(events)
         usage = summarize_usage(events, model=model, pricing=pricing)
+        tool_outcomes = summarize_tool_outcomes(events)
         run_end = next((e for e in reversed(events) if e.get("type") == "run_end"), {})
         run_start = next((e for e in events if e.get("type") == "run_start"), {})
         rows.append(
@@ -240,17 +284,28 @@ def scan_trace_dir(trace_dir: str | Path, pricing: Dict[str, Dict[str, float]] |
                 "thread_id": run_end.get("thread_id") or run_start.get("thread_id"),
                 "resumed": run_end.get("resumed"),
                 **usage,
+                **tool_outcomes,
             }
         )
     return rows
 
 
 def aggregate_usage(rows: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
-    """累计层：把若干「单次运行」的明细加成总数（作品集里「累计花了多少钱」就是它）。"""
+    """累计层：把若干「单次运行」的明细加成总数（作品集里「累计花了多少钱」就是它）。
+
+    除了 token / 成本，也把**工具结局**累计起来（与单次运行同一口径）：
+    `tool_success_rate` = (ok + degraded) / calls（降级成功算成功），
+    `tool_success_rate_main` = ok / calls。
+    """
     rows = list(rows)
     priced = [r for r in rows if r.get("estimated_cost_usd") is not None]
     total_cost = round(sum(float(r["estimated_cost_usd"]) for r in priced), 6) if priced else None
     total_tokens = sum(int(r.get("total_tokens") or 0) for r in rows)
+    tool_calls = sum(int(r.get("tool_calls") or 0) for r in rows)
+    tool_ok = sum(int(r.get("tool_ok") or 0) for r in rows)
+    tool_degraded = sum(int(r.get("tool_degraded") or 0) for r in rows)
+    tool_failed = sum(int(r.get("tool_failed") or 0) for r in rows)
+    tool_succeeded = tool_ok + tool_degraded
     return {
         "runs": len(rows),
         "runs_with_pricing": len(priced),
@@ -261,6 +316,15 @@ def aggregate_usage(rows: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
         "avg_tokens_per_run": round(total_tokens / len(rows), 1) if rows else None,
         "avg_cost_per_run_usd": round(total_cost / len(priced), 6) if priced else None,
         "pricing_unit": PRICING_UNIT,
+        "total_tool_calls": tool_calls,
+        "total_tool_ok": tool_ok,
+        "total_tool_degraded": tool_degraded,
+        "total_tool_failed": tool_failed,
+        "total_tool_succeeded": tool_succeeded,
+        # 成功率 = (ok + degraded) / calls：降级成功**算成功**（调用方拿到了结果），
+        # 但 degraded 单独计数，所以主通道健康度看 tool_success_rate_main。
+        "tool_success_rate": round(tool_succeeded / tool_calls, 4) if tool_calls else None,
+        "tool_success_rate_main": round(tool_ok / tool_calls, 4) if tool_calls else None,
         "note": ("有运行未命中单价表 → 累计成本只统计命中的那部分，token 是全量"
                  if priced and len(priced) != len(rows) else None),
     }

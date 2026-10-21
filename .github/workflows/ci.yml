@@ -62,7 +62,8 @@ jobs:
       # 不需要任何密钥：LLM 走 tests/fake_llm.py 的脚本化假模型。
       # 需要同源仓库 rag-mcp-server 的集成用例在 runner 上不存在该仓库，
       # 会被测试里自带的 skipif 自动跳过（显式 skip，不是失败）。
-      # 本机（有兄弟仓库 + BGE 模型缓存）实测：95 passed, 1 skipped。
-      # （2026-10-20 修复评测假绿 + 补单测后从 81 涨到 95；README §7 是同一口径）
+      # 本机（有兄弟仓库 + BGE 模型缓存）实测：151 passed, 1 skipped。
+      # runner 上没有兄弟仓库 → 5 个集成用例显式 skip：147 passed, 5 skipped。
+      # （README §7 是同一口径；2026-10-21 审计修复后新增 21 条用例）
       - name: 单元测试
         run: python -m pytest -q -rs

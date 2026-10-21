@@ -101,7 +101,11 @@ DEFAULTS: Dict[str, Any] = {
         "inject_top_k": 3,        # 任务启动时自动注入的相关记忆条数
         "max_inject_chars": 800,  # 注入文本长度上限（控制上下文成本）
         "max_content_chars": 2000,
-        "max_records": 2000,      # 超过后自动 compaction（同 key 只留最新）
+        # ★ 旧名 max_records 名不副实（它不是「记录条数上限」，而是「JSONL 文件行数
+        #   超过它就重写文件、同 key 只留最新」），所以改名为 compact_threshold。
+        #   旧配置里的 max_records 仍然生效（读到时给一条 DeprecationWarning）。
+        "compact_threshold": 2000,
+        "ttl_seconds": 0,         # 记忆默认存活秒数（0 = 永不过期）
     },
     "trace": {
         "dir": "./traces",

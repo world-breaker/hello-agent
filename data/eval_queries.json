@@ -448,5 +448,113 @@
     "expected_refusal": true,
     "answer_must_contain": ["没有关于|查不到|未找到|没有相关内容|不知道|不涉及"],
     "answer_must_not_contain": ["参数量", "开源协议", "评测得分"]
+  },
+  {
+    "id": "q51",
+    "category": "memory",
+    "task": "记住：以后所有回答都用中文。",
+    "expect_tools": ["remember_fact"],
+    "expected_refusal": false,
+    "answer_must_contain": ["记住|已记|记下|中文"],
+    "answer_must_not_contain": [],
+    "expect_memory_content_contains": ["中文"],
+    "expect_memory_absent": [],
+    "expect_memory_wrong_not_used": []
+  },
+  {
+    "id": "q52",
+    "category": "memory",
+    "task": "记住：我的项目根目录是 D:/projects/hello-agent。",
+    "expect_tools": ["remember_fact"],
+    "expected_refusal": false,
+    "answer_must_contain": ["记住|已记|记下"],
+    "answer_must_not_contain": [],
+    "expect_memory_content_contains": ["D:/projects/hello-agent"],
+    "expect_memory_absent": [],
+    "expect_memory_wrong_not_used": []
+  },
+  {
+    "id": "q53",
+    "category": "memory",
+    "task": "请记住这两条长期约定：① 代码用 Python 3.12；② 注释一律写中文。",
+    "expect_tools": ["remember_fact"],
+    "expected_refusal": false,
+    "answer_must_contain": ["记住|已记|记下"],
+    "answer_must_not_contain": [],
+    "expect_memory_content_contains": ["Python 3.12", "中文"],
+    "expect_memory_absent": [],
+    "expect_memory_wrong_not_used": []
+  },
+  {
+    "id": "q54",
+    "category": "memory",
+    "task": "这是一次性的临时访问令牌 tmp-8f3a9c2b7d6e，用完就扔，别写进长期记忆。顺便帮我算一下 7×8 等于多少。",
+    "expect_tools": ["calculator"],
+    "expected_refusal": false,
+    "answer_must_contain": ["56"],
+    "answer_must_not_contain": [],
+    "expect_memory_content_contains": [],
+    "expect_memory_absent": ["tmp-8f3a9c2b7d6e", "临时访问令牌"],
+    "expect_memory_wrong_not_used": []
+  },
+  {
+    "id": "q55",
+    "category": "memory",
+    "task": "今天天气不错，聊聊心情吧。顺便帮我算一下 100 除以 4 等于多少。",
+    "expect_tools": ["calculator"],
+    "expected_refusal": false,
+    "answer_must_contain": ["25"],
+    "answer_must_not_contain": [],
+    "expect_memory_content_contains": [],
+    "expect_memory_absent": ["天气不错", "心情"],
+    "expect_memory_wrong_not_used": []
+  },
+  {
+    "id": "q56",
+    "category": "memory",
+    "task": "这次就临时用方案 A，下一次不一定沿用，别写进长期记忆。帮我算 12 乘 12 等于多少。",
+    "expect_tools": ["calculator"],
+    "expected_refusal": false,
+    "answer_must_contain": ["144"],
+    "answer_must_not_contain": [],
+    "expect_memory_content_contains": [],
+    "expect_memory_absent": ["方案 A", "方案A"],
+    "expect_memory_wrong_not_used": []
+  },
+  {
+    "id": "q57",
+    "category": "memory",
+    "task": "以后我的项目根目录统一用 D:/work/new-repo，请记住它。另外我记忆里好像存过一个旧的项目路径，那个已经过期了，不要拿它当现在的路径。",
+    "expect_tools": ["remember_fact"],
+    "expected_refusal": false,
+    "answer_must_contain": ["记住|已记|记下"],
+    "answer_must_not_contain": [],
+    "expect_memory_content_contains": ["D:/work/new-repo"],
+    "expect_memory_absent": [],
+    "expect_memory_wrong_not_used": ["D:/old-project"],
+    "memory_seed": [
+      {
+        "key": "project_root",
+        "content": "我的项目根目录是 D:/old-project"
+      }
+    ]
+  },
+  {
+    "id": "q58",
+    "category": "memory",
+    "task": "以后请一直用中文回答我。",
+    "expect_tools": ["remember_fact"],
+    "expected_refusal": false,
+    "answer_must_contain": ["记住|已记|记下|中文"],
+    "answer_must_not_contain": [],
+    "expect_memory_content_contains": ["中文"],
+    "expect_memory_absent": [],
+    "expect_memory_wrong_not_used": ["英文"],
+    "memory_seed": [
+      {
+        "key": "lang_pref",
+        "content": "用户的回答语言偏好是英文"
+      }
+    ]
   }
 ]

@@ -21,14 +21,21 @@
       这样同一份 ground truth 能容忍「没有相关内容 / 查不到 / 未找到」等不同措辞。
     - `answer_must_not_contain`：不该出现的词（抓幻觉用，可空）。
       只放「**断言形状**」的词（如「收盘价为」「晴转多云」），不要放会被原样复述的题面词。
+    - `expect_memory_content_contains` / `expect_memory_absent` / `expect_memory_wrong_not_used`：
+      跨任务长期记忆的三类标注（**全部可选**，缺字段 = 「不检查该项」，不会把老用例判成失败）：
+      · `expect_memory_content_contains` —— **该记**：期望长期记忆里出现的内容片段；
+      · `expect_memory_absent`          —— **不该记**：期望记忆里**不**出现的片段（一次性凭据 / 临时指令 / 闲聊）；
+      · `expect_memory_wrong_not_used`   —— **召回错**：记忆里存在但**不应被当事实采信**的内容，
+        期望最终回答**不依赖**它（允许「提到了但已更正」，见 §score_memory）。
 """
 
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, Iterable, List, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -74,6 +81,107 @@ _REFUSAL_MARKERS = (
 ANSWER_SOURCE_MODEL = "model"
 ANSWER_SOURCE_SYSTEM_FALLBACK = "system_fallback"
 
+# ---------------- 记忆评测：常量 ----------------
+
+# 记忆工具名（agent/memory.py 里注册的两个）
+MEMORY_WRITE_TOOL = "remember_fact"
+MEMORY_READ_TOOL = "recall_memory"
+
+# 「提到了但已更正」的标记词。
+# ★ 为什么需要它：判断「错误记忆有没有被当事实用」不能只看「答案里有没有出现那段文字」——
+#   正确行为可能是**指出它过时**（「记忆里是 D:/old-project，但你这次给的是 D:/work/new-repo，
+#   以本次为准」），这句话里确实出现了旧内容，却**没有拿它当事实**。
+#   所以：旧内容出现的**同一句**里带这些词 → 记为「提到但已更正」（不算违规）。
+#   ★ 局限：这是词表启发式，会有假阴性（模型用别的措辞说「以你这次为准」），
+#   也可能有假阳性（模型说「以…为准」但其实在拿旧值当事实）—— 指标连着分母一起看。
+_CORRECTION_MARKERS = (
+    "以本次",
+    "以这次",
+    "以当前",
+    "以任务",
+    "为准",
+    "已过时",
+    "过时",
+    "过期",
+    "不再",
+    "更正",
+    "更新",
+    "改成",
+    "而不是",
+    "冲突",
+    "不一致",
+    "忽略",
+    "作废",
+    "失效",
+)
+
+# 句子分隔符：用来判断「更正标记」与「旧内容」是否落在同一句里
+_SENTENCE_SPLIT_RE = re.compile(r"[。！？!?；;\n]")
+
+
+@dataclass
+class MemoryState:
+    """一次运行里「记忆」这一侧的可观测状态。
+
+    ★ 关键决定：**记忆状态从 trace + 记忆库快照来，不读运行时的内存对象**。
+      这样「已有 trace 不用重跑也能重算记忆指标」，与工具指标同一套口径（可回放、可复盘）。
+      证据有四路：
+      ① `memory_injected` 事件（runner 在任务启动时写）：注入了几条、命中哪些 key；
+         ★ 注意：这条事件**只记 key、不记内容**（注入文本本身在 system prompt 里，不落 trace），
+         所以「自动注入的内容」无法离线复原——这是已知边界，README §5.9.5 里写明；
+      ② `thought` / `action` 事件里 `remember_fact` 的调用参数 → **写了什么**；
+      ③ `observation` 事件里 `remember_fact` / `recall_memory` 的结果 → **写成功没有 / 召回到了什么**；
+      ④ 可选的**记忆库 JSONL 快照**（跑完之后的长期记忆里到底有什么）→ `store_contents`。
+    """
+
+    # 真正写进记忆的内容（trace 里 remember_fact 成功的那几次）
+    written_contents: List[str] = field(default_factory=list)
+    # 发起过 remember_fact 的内容（**可能写失败**，例如被「疑似密钥」拦下）
+    attempted_contents: List[str] = field(default_factory=list)
+    written_keys: List[str] = field(default_factory=list)
+    # 本次显式召回到的内容（recall_memory 的返回）
+    recalled_contents: List[str] = field(default_factory=list)
+    # 任务启动时自动注入的记忆 key（内容不在 trace 里）
+    injected_keys: List[str] = field(default_factory=list)
+    injected_count: int = 0
+    # 记忆库当前内容（可选，来自 JSONL 快照）
+    store_contents: List[str] = field(default_factory=list)
+    store_keys: List[str] = field(default_factory=list)
+    # 证据来源标记：trace / store / trace+store
+    source: str = ""
+
+    @property
+    def corpus(self) -> List[str]:
+        """本次运行可见的「记忆语料」：写进去的 + 记忆库里有的 + 召回到的。"""
+        return _dedup(self.written_contents + self.store_contents + self.recalled_contents)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """可 JSON 序列化的视图（评测结果落盘用）。"""
+        return {
+            "written_contents": list(self.written_contents),
+            "attempted_contents": list(self.attempted_contents),
+            "written_keys": list(self.written_keys),
+            "recalled_contents": list(self.recalled_contents),
+            "injected_keys": list(self.injected_keys),
+            "injected_count": self.injected_count,
+            "store_contents": list(self.store_contents),
+            "store_keys": list(self.store_keys),
+            "source": self.source,
+        }
+
+
+def _dedup(items: Iterable[str]) -> List[str]:
+    """去重并保序（空串丢掉）。"""
+    seen = set()
+    out: List[str] = []
+    for item in items:
+        text = str(item or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+    return out
+
 
 @dataclass
 class EvalRecord:
@@ -101,6 +209,8 @@ class EvalRecord:
     completion_tokens: int = 0
     total_tokens: int = 0
     estimated_cost_usd: float | None = None
+    # 记忆这一侧的可观测状态（trace + 记忆库快照重算；None = 没有记忆证据 → 不进记忆指标分母）
+    memory_state: MemoryState | None = None
 
 
 def load_eval_set(path: str | Path) -> List[Dict[str, Any]]:
@@ -161,6 +271,37 @@ def answer_must_not_contain(query: Dict[str, Any] | None) -> List[str]:
     return _as_list((query or {}).get("answer_must_not_contain"))
 
 
+# ---------------- 记忆 ground truth（向后兼容：缺字段 = 不检查该项）----------------
+
+
+def expected_memory_content_contains(query: Dict[str, Any] | None) -> List[str]:
+    """**该记**：期望长期记忆里出现的内容片段。"""
+    return _as_list((query or {}).get("expect_memory_content_contains"))
+
+
+def expected_memory_absent(query: Dict[str, Any] | None) -> List[str]:
+    """**不该记**：期望记忆里**不**出现的内容片段。"""
+    return _as_list((query or {}).get("expect_memory_absent"))
+
+
+def expected_memory_wrong_not_used(query: Dict[str, Any] | None) -> List[str]:
+    """**召回错**：记忆里存在但不应被当事实采信的内容（期望最终回答不依赖它）。"""
+    return _as_list((query or {}).get("expect_memory_wrong_not_used"))
+
+
+def has_memory_ground_truth(query: Dict[str, Any] | None) -> bool:
+    """这条 query 是否**显式标注**了任何记忆期望（区分「没标注」与「标注了空列表」）。"""
+    query = query or {}
+    return any(
+        key in query
+        for key in (
+            "expect_memory_content_contains",
+            "expect_memory_absent",
+            "expect_memory_wrong_not_used",
+        )
+    )
+
+
 def match_keyword(answer: str, keyword: str) -> bool:
     """关键词命中判定。
 
@@ -176,7 +317,11 @@ def match_keyword(answer: str, keyword: str) -> bool:
     return False
 
 
-def score_answer(query: Dict[str, Any] | None, answer: str) -> Dict[str, Any]:
+def score_answer(
+    query: Dict[str, Any] | None,
+    answer: str,
+    memory_state: MemoryState | None = None,
+) -> Dict[str, Any]:
     """按 ground truth 给一条答案打分（纯函数，可离线单测）。
 
     返回：
@@ -185,13 +330,15 @@ def score_answer(query: Dict[str, Any] | None, answer: str) -> Dict[str, Any]:
         recall：要点命中率（命中数 / 要点数，无要点时为 None）；
         full_hit：要点是否全部命中；
         hallucinated：是否命中了「不该出现」的词。
+        memory：**给了 memory_state 时**额外挂上记忆打分结果（见 score_memory）；
+            不给就不出现这个键（老调用方拿到的字典形状逐字不变）。
     """
     must = answer_must_contain(query)
     must_not = answer_must_not_contain(query)
     hits = [kw for kw in must if match_keyword(answer, kw)]
     missed = [kw for kw in must if kw not in hits]
     violated = [kw for kw in must_not if match_keyword(answer, kw)]
-    return {
+    result = {
         "must_hits": hits,
         "must_missed": missed,
         "must_not_violated": violated,
@@ -199,6 +346,330 @@ def score_answer(query: Dict[str, Any] | None, answer: str) -> Dict[str, Any]:
         "full_hit": bool(must) and not missed,
         "hallucinated": bool(violated),
     }
+    if memory_state is not None:
+        result["memory"] = score_memory(query, answer, memory_state)
+    return result
+
+
+# ---------------- 记忆状态：从 trace / 记忆库快照重算 ----------------
+
+
+def _parse_json_maybe(text: Any) -> Any:
+    """尽力把一段文本解析成 JSON；解析不了返回 None（不抛异常）。"""
+    if isinstance(text, (dict, list)):
+        return text
+    if not isinstance(text, str):
+        return None
+    raw = text.strip()
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+
+
+# 结果预览可能被截断（工具结果限长 1200 字符），所以再兜一层正则抠 content 字段
+_CONTENT_RE = re.compile(r'"content"\s*:\s*"((?:[^"\\]|\\.)*)"')
+
+
+def _remember_result_key(preview: Any) -> str:
+    """从 remember_fact 的返回里取 key（拿不到就返回空串）。"""
+    data = _parse_json_maybe(preview)
+    if isinstance(data, dict):
+        return str(data.get("key") or "")
+    return ""
+
+
+def _recall_result_contents(preview: Any) -> List[str]:
+    """从 recall_memory 的返回里取回召回到的内容。
+
+    正常走 JSON 解析；预览被截断导致解析不了时，退化成正则抠 `"content"` 字段
+    （尽力而为：抠不全就少判几条，不编内容）。
+    """
+    data = _parse_json_maybe(preview)
+    if isinstance(data, dict):
+        results = data.get("results")
+        if isinstance(results, list):
+            return [
+                str(item.get("content") or "").strip()
+                for item in results
+                if isinstance(item, dict) and str(item.get("content") or "").strip()
+            ]
+        return []
+    if isinstance(preview, str):
+        return [m.group(1) for m in _CONTENT_RE.finditer(preview) if m.group(1).strip()]
+    return []
+
+
+def _match_writes(
+    calls: List[Tuple[str, str]],
+    ok_keys: List[str],
+) -> List[Tuple[str, str]]:
+    """把「写成功的 observation」与「发起过的 remember_fact 调用」配对。
+
+    - 先按 **key 精确配对**（调用显式给了 key 时两边一致）；
+    - 剩下按**顺序**兜底配对（key 是存储层自动生成的 `mem_xxx`，调用参数里看不到）。
+
+    ★ 为什么要配对：只有「写成功」的那次才算真的进了长期记忆；
+      写失败（例如内容形似密钥被工具拒了）的内容**不算**「记住了」。
+    """
+    matched: List[Tuple[str, str]] = []
+    used: set[int] = set()
+    for key in ok_keys:
+        if not key:
+            continue
+        for idx, (content, call_key) in enumerate(calls):
+            if idx in used:
+                continue
+            if call_key and call_key == key:
+                matched.append((content, key))
+                used.add(idx)
+                break
+    matched_keys = {key for _, key in matched}
+    spare = [key for key in ok_keys if key and key not in matched_keys]
+    for key in spare:
+        for idx, (content, _call_key) in enumerate(calls):
+            if idx in used:
+                continue
+            matched.append((content, key))
+            used.add(idx)
+            break
+    return matched
+
+
+def memory_state_from_trace(trace_path: str | Path) -> MemoryState:
+    """从一次运行的 JSONL trace 里重算「记忆状态」。
+
+    证据来源（全部来自 trace，**不用重跑**也能重算）：
+    - `thought` / `action` 事件里 `remember_fact` 的调用参数 → 写了什么；
+    - `observation` 事件里 `remember_fact` 且 `ok=True` → 写成功没有（返回里带 key）；
+    - `observation` 事件里 `recall_memory` 且 `ok=True` → 召回到了什么内容；
+    - `memory_injected` 事件 → 任务启动时自动注入了几条、命中哪些 key。
+    """
+    state = MemoryState(source="trace")
+    path = Path(trace_path)
+    if not path.exists():
+        return state
+
+    calls: List[Tuple[str, str]] = []
+    ok_keys: List[str] = []
+
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(ev, dict):
+                continue
+            event_type = ev.get("type")
+            if event_type in ("thought", "action"):
+                for call in ev.get("tool_calls") or []:
+                    if not isinstance(call, dict) or call.get("name") != MEMORY_WRITE_TOOL:
+                        continue
+                    args = call.get("args") or {}
+                    content = str(args.get("content") or "").strip()
+                    if not content:
+                        continue
+                    calls.append((content, str(args.get("key") or "").strip()))
+                    state.attempted_contents.append(content)
+            elif event_type == "observation":
+                tool = ev.get("tool")
+                if tool == MEMORY_WRITE_TOOL and ev.get("ok"):
+                    ok_keys.append(_remember_result_key(ev.get("result_preview")))
+                elif tool == MEMORY_READ_TOOL and ev.get("ok"):
+                    state.recalled_contents.extend(
+                        _recall_result_contents(ev.get("result_preview"))
+                    )
+            elif event_type == "memory_injected":
+                state.injected_count = int(ev.get("count") or 0)
+                state.injected_keys.extend(str(k) for k in (ev.get("keys") or []))
+
+    matched = _match_writes(calls, ok_keys)
+    state.written_contents = [content for content, _ in matched]
+    state.written_keys = _dedup(
+        [key for _, key in matched if key] + [key for key in ok_keys if key]
+    )
+    state.attempted_contents = _dedup(state.attempted_contents)
+    state.recalled_contents = _dedup(state.recalled_contents)
+    state.injected_keys = _dedup(state.injected_keys)
+    return state
+
+
+def memory_state_from_store(path: str | Path) -> MemoryState:
+    """从记忆库 JSONL 快照里读「长期记忆里现在到底有什么」。
+
+    这是**记忆内容的权威口径**（长期记忆是落盘的数据，不该只靠 trace 反推）。
+    读的是快照，不改任何东西。
+    """
+    state = MemoryState(source="store")
+    file_path = Path(path)
+    if not file_path.exists():
+        return state
+    for line in file_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(data, dict):
+            continue
+        content = str(data.get("content") or "").strip()
+        if not content:
+            continue
+        state.store_contents.append(content)
+        state.store_keys.append(str(data.get("key") or ""))
+    state.store_contents = _dedup(state.store_contents)
+    state.store_keys = _dedup(state.store_keys)
+    return state
+
+
+def merge_memory_states(*states: MemoryState | None) -> MemoryState:
+    """把多个记忆状态合并成一个（trace 的 + 记忆库快照的）。"""
+    merged = MemoryState()
+    sources: List[str] = []
+    for state in states:
+        if state is None:
+            continue
+        merged.written_contents.extend(state.written_contents)
+        merged.attempted_contents.extend(state.attempted_contents)
+        merged.written_keys.extend(state.written_keys)
+        merged.recalled_contents.extend(state.recalled_contents)
+        merged.injected_keys.extend(state.injected_keys)
+        merged.injected_count += state.injected_count
+        merged.store_contents.extend(state.store_contents)
+        merged.store_keys.extend(state.store_keys)
+        if state.source and state.source not in sources:
+            sources.append(state.source)
+    merged.written_contents = _dedup(merged.written_contents)
+    merged.attempted_contents = _dedup(merged.attempted_contents)
+    merged.written_keys = _dedup(merged.written_keys)
+    merged.recalled_contents = _dedup(merged.recalled_contents)
+    merged.injected_keys = _dedup(merged.injected_keys)
+    merged.store_contents = _dedup(merged.store_contents)
+    merged.store_keys = _dedup(merged.store_keys)
+    merged.source = "+".join(sources)
+    return merged
+
+
+# ---------------- 记忆打分 ----------------
+
+
+def _match_any(texts: Iterable[str], fragment: str) -> bool:
+    """片段是否出现在任一文本里（与答案要点同一套 `a|b` / 忽略大小写的匹配口径）。"""
+    return any(match_keyword(text, fragment) for text in texts)
+
+
+def _is_corrected_mention(answer: str, fragment: str) -> bool:
+    """答案里出现了「不该采信的旧内容」，但**同一句**里有更正标记 → 记为「提到但已更正」。
+
+    例：记忆里是 D:/old-project，你这次给的是 D:/work/new-repo，以本次为准
+        —— 句子里带了「以本次为准」，说明模型是在**指出冲突**，不是拿旧值当事实。
+    """
+    text = answer or ""
+    for sentence in _SENTENCE_SPLIT_RE.split(text):
+        if not match_keyword(sentence, fragment):
+            continue
+        if any(marker in sentence for marker in _CORRECTION_MARKERS):
+            return True
+    return False
+
+
+def score_memory(
+    query: Dict[str, Any] | None,
+    answer: str,
+    memory_state: MemoryState | None,
+) -> Dict[str, Any]:
+    """按 ground truth 给「记忆行为」打分（纯函数，可离线单测）。
+
+    三类判定：
+    1. **该记**（`expect_memory_content_contains`）：片段应出现在记忆语料里
+       （本次写进去的 ∪ 记忆库快照里有的）；另外单独报「是不是真的写进去了」。
+    2. **不该记**（`expect_memory_absent`）：片段**不应**出现在记忆语料里
+       （写进去的 ∪ 记忆库里的 ∪ 召回到的）；若只是**发起过**但没写进去（如被密钥规则拦下），
+       记在 `absent_attempted` 里（信息项，不算违规）。
+    3. **召回错**（`expect_memory_wrong_not_used`）：片段是「记忆里有但不该采信」的内容。
+       - 记忆里**根本没有**它 → 陷阱没踩到，**不计分**（记在 `wrong_not_present`）；
+       - 答案里**没**用它 → 合格；
+       - 答案里用了它，但同一句有更正标记 → 记为「提到但已更正」，合格；
+       - 答案里直接拿它当事实 → 违规（`wrong_used`）。
+
+    ★ 记忆状态为 None（没有 trace / 没有记忆库快照）→ `checked=False`，
+      所有判定都不做（老用例缺新字段时不会被判成失败）。
+    """
+    contains = expected_memory_content_contains(query)
+    absent = expected_memory_absent(query)
+    wrong = expected_memory_wrong_not_used(query)
+
+    result: Dict[str, Any] = {
+        "checked": False,
+        "remember_hits": [],
+        "remember_missed": [],
+        "write_hits": [],
+        "write_missed": [],
+        "absent_violations": [],
+        "absent_attempted": [],
+        "wrong_used": [],
+        "wrong_present": [],
+        "wrong_mentioned_corrected": [],
+        "wrong_not_present": [],
+        "remember_ok": True,
+        "write_ok": True,
+        "absent_ok": True,
+        "wrong_ok": True,
+        "pass": None,
+    }
+    if memory_state is None:
+        return result
+
+    result["checked"] = True
+    corpus = memory_state.corpus
+    written = memory_state.written_contents
+
+    for fragment in contains:
+        if _match_any(corpus, fragment):
+            result["remember_hits"].append(fragment)
+        else:
+            result["remember_missed"].append(fragment)
+        if _match_any(written, fragment):
+            result["write_hits"].append(fragment)
+        else:
+            result["write_missed"].append(fragment)
+    result["remember_ok"] = not result["remember_missed"]
+    result["write_ok"] = not result["write_missed"]
+
+    for fragment in absent:
+        if _match_any(corpus, fragment):
+            result["absent_violations"].append(fragment)
+        elif _match_any(memory_state.attempted_contents, fragment):
+            # 发起过但没写进去（如被「疑似密钥」规则拒了）→ 信息项，不算违规
+            result["absent_attempted"].append(fragment)
+
+    for fragment in wrong:
+        if not _match_any(corpus, fragment):
+            # 记忆里根本没有这条 → 陷阱没踩到，不进这一项的分母
+            result["wrong_not_present"].append(fragment)
+            continue
+        result["wrong_present"].append(fragment)
+        if not match_keyword(answer or "", fragment):
+            continue  # 答案里没出现 → 没被当事实用，合格
+        if _is_corrected_mention(answer or "", fragment):
+            result["wrong_mentioned_corrected"].append(fragment)
+        else:
+            result["wrong_used"].append(fragment)
+
+    result["absent_ok"] = not result["absent_violations"]
+    result["wrong_ok"] = not result["wrong_used"]
+    result["pass"] = bool(
+        result["remember_ok"] and result["absent_ok"] and result["wrong_ok"]
+    )
+    return result
 
 
 def extract_tool_names(trace_path: str | Path) -> List[str]:
@@ -368,6 +839,53 @@ def evaluate(records: List[EvalRecord]) -> Dict[str, Any]:
                 "violated": s["must_not_violated"],
             })
 
+    # ---------------- 记忆评测：该记 / 不该记 / 召回错 ----------------
+    # 分母口径与其它指标一致：**只统计真正完成的运行**（status=completed），
+    # 并且必须**有记忆状态**（trace / 记忆库快照）才判；
+    # 标了记忆 ground truth 却没进分母的运行（失败的运行、或没取到记忆状态的），
+    # 单独报 `memory_not_scored_n`——既不进分子也不进分母（不装作「检查过且通过」）。
+    memory_labeled = [r for r in records if has_memory_ground_truth(r.query)]
+    memory_scored = [
+        r for r in memory_labeled
+        if r.memory_state is not None and r.status == "completed"
+    ]
+    memory_remember_hits = 0
+    memory_remember_total = 0
+    memory_write_hits = 0
+    memory_absent_violations = 0
+    memory_absent_total = 0
+    memory_absent_attempted = 0
+    memory_wrong_used = 0
+    memory_wrong_present = 0
+    memory_pass = 0
+    memory_wrong_used_ids: List[Dict[str, Any]] = []
+    memory_failures: List[Dict[str, Any]] = []
+    for r in memory_scored:
+        s = score_memory(r.query, r.final_answer, r.memory_state)
+        memory_remember_hits += len(s["remember_hits"])
+        memory_remember_total += len(s["remember_hits"]) + len(s["remember_missed"])
+        memory_write_hits += len(s["write_hits"])
+        memory_absent_violations += len(s["absent_violations"])
+        memory_absent_total += len(expected_memory_absent(r.query))
+        memory_absent_attempted += len(s["absent_attempted"])
+        # 召回错：只对「记忆里确实存在」的错误内容计分（陷阱没踩到就不算分）
+        memory_wrong_present += len(s["wrong_present"])
+        memory_wrong_used += len(s["wrong_used"])
+        if s["wrong_used"]:
+            memory_wrong_used_ids.append({
+                "id": r.query.get("id"),
+                "used": s["wrong_used"],
+            })
+        if s["pass"]:
+            memory_pass += 1
+        else:
+            memory_failures.append({
+                "id": r.query.get("id"),
+                "remember_missed": s["remember_missed"],
+                "absent_violations": s["absent_violations"],
+                "wrong_used": s["wrong_used"],
+            })
+
     # 分类别完成率
     by_cat: Dict[str, Dict[str, int]] = {}
     for r in records:
@@ -424,6 +942,35 @@ def evaluate(records: List[EvalRecord]) -> Dict[str, Any]:
         "hallucination_rate": _rate(len(hallucination_hits), len(hallucination_scored)),
         "hallucination_n": len(hallucination_scored),
         "hallucination_hits": hallucination_hits,
+        # 记忆评测：该记 / 不该记 / 召回错（分母都只算「完成且有记忆状态」的运行）
+        "memory_labeled_n": len(memory_labeled),
+        "memory_scored_n": len(memory_scored),
+        # 标了记忆标注但没进分母的运行数（失败运行 + 没取到记忆状态的）
+        "memory_not_scored_n": len(memory_labeled) - len(memory_scored),
+        # 该记：期望出现在记忆里的片段，命中了多少
+        "memory_remember_rate": _rate(memory_remember_hits, memory_remember_total),
+        "memory_remember_n": memory_remember_total,
+        "memory_remember_hits": memory_remember_hits,
+        # 该记：其中**真的写进了记忆**（remember_fact 写成功）的比例
+        "memory_write_rate": _rate(memory_write_hits, memory_remember_total),
+        "memory_write_n": memory_remember_total,
+        "memory_write_hits": memory_write_hits,
+        # 不该记：期望不出现却出现在记忆里的片段占比（越低越好）
+        "memory_absent_violation_rate": _rate(memory_absent_violations, memory_absent_total),
+        "memory_absent_n": memory_absent_total,
+        "memory_absent_violations": memory_absent_violations,
+        "memory_absent_attempted_n": memory_absent_attempted,
+        # 召回错：记忆里确实存在的错误内容里，没被当事实用的比例
+        "memory_wrong_not_used_rate": _rate(
+            memory_wrong_present - memory_wrong_used, memory_wrong_present
+        ),
+        "memory_wrong_present_n": memory_wrong_present,
+        "memory_wrong_used_n": memory_wrong_used,
+        "memory_wrong_used": memory_wrong_used_ids,
+        # 三项全过
+        "memory_pass_rate": _rate(memory_pass, len(memory_scored)),
+        "memory_pass_n": len(memory_scored),
+        "memory_failures": memory_failures,
         "total_prompt_tokens": sum(r.prompt_tokens for r in records),
         "total_completion_tokens": sum(r.completion_tokens for r in records),
         "total_tokens": total_tokens,
@@ -496,6 +1043,30 @@ def render_markdown(summary: Dict[str, Any], records: List[EvalRecord]) -> str:
         lines.append(
             f"- 幻觉率（命中「不该出现」词的运行占比）：**{summary.get('hallucination_rate')}**"
             f"（n={summary.get('hallucination_n')}）"
+        )
+        # 记忆评测（分母为 0 时报 None = 算不出来，不报 0）
+        lines.append(
+            f"- 记忆「该记」命中率（期望出现在长期记忆里的片段）："
+            f"**{summary.get('memory_remember_rate')}**"
+            f"（n={summary.get('memory_remember_n')} 片段；"
+            f"其中真正写进记忆的比例 **{summary.get('memory_write_rate')}**）"
+        )
+        lines.append(
+            f"- 记忆「不该记」违规率（不该进记忆却进了的片段占比）："
+            f"**{summary.get('memory_absent_violation_rate')}**"
+            f"（n={summary.get('memory_absent_n')} 片段）"
+        )
+        lines.append(
+            f"- 记忆「召回错」未采信率（记忆里有但没被当事实用的比例）："
+            f"**{summary.get('memory_wrong_not_used_rate')}**"
+            f"（n={summary.get('memory_wrong_present_n')} 片段，"
+            f"其中被当事实用了 {summary.get('memory_wrong_used_n')} 个）"
+        )
+        lines.append(
+            f"- 记忆三项全过率： **{summary.get('memory_pass_rate')}**"
+            f"（n={summary.get('memory_pass_n')} 条记忆用例；"
+            f"标了记忆标注但没进分母的 "
+            f"{summary.get('memory_not_scored_n')} 条不计分）"
         )
         lines.append(f"- 总 token：**{summary.get('total_tokens')}**"
                      f"（in {summary.get('total_prompt_tokens')} / out {summary.get('total_completion_tokens')}），"

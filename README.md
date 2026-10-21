@@ -16,8 +16,8 @@
 
 | 项目 | 事实 | 证据位置 |
 |---|---|---|
-| 离线测试 | `151 passed / 1 skipped`（MCP 端到端测试用环境变量开启，全开为 `152 passed`） | §7 |
-| 评测集 | `data/eval_queries.json` **50 条**带 ground truth（工具期望 / 该不该拒答 / 答案要点 / 幻觉陷阱） | §5.9 |
+| 离线测试 | `180 passed / 1 skipped`（MCP 端到端测试用环境变量开启，全开为 `181 passed`） | §7 |
+| 评测集 | `data/eval_queries.json` **58 条**带 ground truth（工具期望 / 该不该拒答 / 答案要点 / 幻觉陷阱 / **记忆三类标注**） | §5.9 |
 | 压缩代价 | 压缩开 / 关同任务对照：上下文省 29.3%，代价是答案要点命中率 0.758→0.613、工具参数被压坏 5 次（**假模型**，未测语义质量） | §5.6.1 |
 | 真实任务 | 三条 demo 全部 `status=completed`（步数 3 / 4 / 2，总耗时 30.97s） | §1 |
 | 最大步数 | `--max-steps 1` 稳定得到「未完成收尾」，不会假完成 | §1.3 |
@@ -734,13 +734,13 @@ trace 里也能直接看出来（这就是「客观证据」而不是口头声�
 
 ### 5.9 量化评测与指标口径（`agent/eval_harness.py`）
 
-`scripts/eval_agent.py` 跑 `data/eval_queries.json`（**50 条**，每条带 ground truth 标注），
+`scripts/eval_agent.py` 跑 `data/eval_queries.json`（**58 条**，每条带 ground truth 标注），
 把每次运行聚合成作品集级指标。**指标最容易骗人的地方不是算错，而是口径没说清**——
 所以每个指标都写死了「分母是谁」，并且把分子分母一起报出来。
 
-#### 5.9.0 评测集与 ground truth（50 条，8 个分类）
+#### 5.9.0 评测集与 ground truth（58 条，9 个分类）
 
-评测集从 **16 条 smoke 级**扩到 **50 条**，每条都带可判定的 ground truth：
+评测集从 **16 条 smoke 级**扩到 **50 条**、再到 **58 条**，每条都带可判定的 ground truth：
 
 | 字段 | 含义 | 取值约定 |
 |---|---|---|
@@ -748,9 +748,13 @@ trace 里也能直接看出来（这就是「客观证据」而不是口头声�
 | `expected_refusal` | 这一问模型**是否应当承认做不到 / 不知道** | 领域外问题**必须**为 `true`；工具失败应降级的题也为 `true` |
 | `answer_must_contain` | 答案里必须出现的要点（1~3 个） | 一项可用 `a\|b\|c` 写多个可接受写法（任一命中即算这条要点命中），容忍「查不到 / 没有相关内容 / 未找到」等措辞差异 |
 | `answer_must_not_contain` | 不该出现的词（抓幻觉） | 只放**断言形状**的词（如「收盘价为」「晴转多云」），不放会被原样复述的题面词 |
+| `expect_memory_content_contains` | **该记**：期望长期记忆里出现的内容片段 | 记忆类用例专用；**缺字段 = 不检查该项**（见 §5.9.5） |
+| `expect_memory_absent` | **不该记**：期望记忆里**不**出现的片段 | 同上；判的是「有没有进长期记忆」，不是「答案里有没有提」 |
+| `expect_memory_wrong_not_used` | **召回错**：记忆里存在但**不应被当事实采信**的内容 | 同上；期望最终回答**不依赖**它（允许「提到了但已更正」，见 §5.9.5） |
+| `memory_seed` | 跑这条用例前**预置**到临时记忆库的（可能过时的）记忆 | 只给「召回错」用例用；用来制造「记忆里有旧事实」的陷阱 |
 
-分类与条数（`retrieval_only` 11 / `retrieval_arithmetic` 8 / `out_of_domain` 8 / `multi_tool` 6 /
-`calculator_only` 5 / `time_only` 4 / `clarification` 4 / `tool_failure_recovery` 4）：
+分类与条数（`retrieval_only` 11 / `retrieval_arithmetic` 8 / `out_of_domain` 8 / **`memory` 8** /
+`multi_tool` 6 / `calculator_only` 5 / `time_only` 4 / `clarification` 4 / `tool_failure_recovery` 4）：
 
 - **单工具**：`retrieval_only` / `calculator_only` / `time_only`；
 - **多工具**：`multi_tool`（检索 → 计算 → 取时间）、`retrieval_arithmetic`（先查再算）；
@@ -758,12 +762,14 @@ trace 里也能直接看出来（这就是「客观证据」而不是口头声�
 - **需要计算 / 需要时间**：分别见 `retrieval_arithmetic` 与 `time_only`；
 - **模糊 / 多义（该澄清）**：`clarification`（4 条，`expect_tools: []`——**不该调工具**，该问清楚）；
 - **工具失败应降级**：`tool_failure_recovery`（4 条：除零、负数开方、语法错、检索成功但计算失败——
-  期望行为是**如实说失败**，不许编一个数）。
+  期望行为是**如实说失败**，不许编一个数）；
+- **跨任务记忆**：`memory`（8 条：**该记** 3 条 / **不该记** 3 条 / **召回错** 2 条，详见 §5.9.5）。
 
 > **向后兼容**：`data/eval_queries.json` 里原有 16 条的 `id / category / task / expect_tools`
 > **逐字未改**，只新增了三个标注字段；打分器对**没有**标注的老条目照常算，
 > 新指标只是「没有」（分母 0 → 报 `None`），不报错、不改变老指标的数值。
 > `expect_tools` 与 `expected_tools` 两个字段名都认（`expect_tools` 优先）。
+> 记忆三件套同理：**缺字段 = 不检查该项**，不会把老用例判成失败。
 
 | 指标 | 口径（分母 = 谁） | 为什么这么定 |
 |---|---|---|
@@ -778,6 +784,11 @@ trace 里也能直接看出来（这就是「客观证据」而不是口头声�
 | `answer_keyword_recall` | **标了 `answer_must_contain` 且 `status=completed` 的运行** | 命中要点数 / 要点总数（见 §5.9.3） |
 | `answer_keyword_full_hit_rate` | 同上 | 要点**全中**的运行占比（比加权 recall 更严） |
 | `hallucination_rate` | **标了 `answer_must_not_contain` 且 `status=completed` 的运行** | 命中「不该出现」词的运行占比（抓幻觉） |
+| `memory_remember_rate` | **标了 `expect_memory_content_contains`、完成、且取到记忆状态的运行** | 「该记」的内容片段里出现在长期记忆中的比例（见 §5.9.5） |
+| `memory_write_rate` | 同上 | 其中**真的写进去了**（`remember_fact` 写成功）的比例——区分「本来就有」与「这次记住了」 |
+| `memory_absent_violation_rate` | **标了 `expect_memory_absent`、完成、且取到记忆状态的运行** | 「不该记」的内容片段里**进了**长期记忆的比例（越低越好） |
+| `memory_wrong_not_used_rate` | 记忆里**确实存在**的错误内容片段 | 其中没被当事实采信的比例（分母只算「陷阱真的踩到」的） |
+| `memory_pass_rate` | 同上三类都判过的运行 | 三项全过的运行占比 |
 | `total_tokens` / `total_cost_usd` | 全部运行（成本只算命中单价表的） | 见 §5.7 |
 
 > **每个比率旁边都有它的分母**（`*_n` 字段，`render_markdown` 也会一起打出来）：
@@ -852,9 +863,10 @@ ground truth 标注，口径与诚实率**完全一致**（分母只算 `status=
    `refusal_accuracy` 用的是更严的新词表——因为「检索成功但片段没提到某个细节」的成功回答里
    也常有「没有」，共用宽松词表会把成功回答误判成拒答（false positive 变假红）。
 
-打分器本身是**纯函数**（`score_answer(query, answer)`），离线可单测：
+打分器本身是**纯函数**（`score_answer(query, answer)`；记忆侧是 `score_memory(query, answer, memory_state)`），
+离线可单测：
 `tests/test_eval_scoring.py` 覆盖严/宽口径、拒答只算完成、关键词命中、空答案、幻觉率、
-老结构条目兼容、两个字段名别名等 **21 条**。
+老结构条目兼容、两个字段名别名等 **21 条**；记忆侧见 §5.9.5 与 `tests/test_memory_eval.py`（**29 条**）。
 
 #### 5.9.4 这套打分的局限（不吹）
 
@@ -865,8 +877,67 @@ ground truth 标注，口径与诚实率**完全一致**（分母只算 `status=
   因此要点允许写多个可接受写法（`a|b|c`），但仍挡不住换一种说法的正确回答。
 - **数值类要点容易因公式口径不同而误判**（如 chunk 数按哪种公式算），
   这类要点一律写成多个可接受值的并集。
-- **50 条仍是小样本**：覆盖的是本项目这 5 类工具与 1 个知识库的分布，不代表线上分布；
+- **58 条仍是小样本**：覆盖的是本项目这 5 类工具与 1 个知识库的分布，不代表线上分布；
   它的作用是**回归护栏**（改动前后同口径对比），不是能力上限的度量。
+- **记忆评测只覆盖内容层面，没覆盖召回排序**（详见 §5.9.5）。
+
+#### 5.9.5 记忆评测：该记 / 不该记 / 召回错
+
+前面 50 条用例全在测「这一轮答得好不好」，**一条都没测「跨任务的记忆对不对」**——
+这正是《Agent 原理与实现详解》§10.3.3 点出的评测缺口。现在补上 **8 条 `memory` 用例**，
+按三类分开标（该记 3 / 不该记 3 / 召回错 2），打分函数是 `score_memory(query, answer, memory_state)`。
+
+**★ 记忆状态从哪来（关键决定）**：**不读运行时的内存对象，只读可回放的证据**——
+与工具指标同一套口径，「已有 trace 不用重跑也能重算」：
+
+| 证据 | 来源 | 能回答什么 |
+|---|---|---|
+| `memory_injected` 事件 | runner 在任务启动时写（`count` / `keys`） | 任务开始时**自动注入了哪几条**（★ 只记 key、**不记内容**——注入文本在 system prompt 里，不落 trace） |
+| `remember_fact` 的调用参数 | `thought` / `action` 事件的 `tool_calls` | 模型**想写**什么 |
+| `remember_fact` 的执行结果 | `observation` 事件（`ok=True`，返回里带 key） | **写成功没有**（失败的不算「记住了」） |
+| `recall_memory` 的返回 | `observation` 事件 | 本次**召回到了什么内容** |
+| 记忆库 JSONL 快照 | 跑完之后的 `data/agent_memory.jsonl`（或临时库） | **长期记忆里现在到底有什么**（落盘数据，比 trace 更权威） |
+
+三者合成一个 `MemoryState`（`written_contents` / `attempted_contents` / `recalled_contents` /
+`injected_keys` / `store_contents`），`score_memory` 拿它 + 最终回答判三类：
+
+| 类别 | ground truth 字段 | 判定口径 |
+|---|---|---|
+| **该记** | `expect_memory_content_contains` | 片段出现在**记忆语料**（本次写进去的 ∪ 记忆库里有的）→ 命中；<br>另外单报 `memory_write_rate`：是不是**真的写进去了**（区分「本来就有」与「这次记住了」） |
+| **不该记** | `expect_memory_absent` | 片段出现在记忆语料（写进去的 ∪ 记忆库里的 ∪ 召回到的）→ **违规**；<br>只是**发起过**但没写进去（如被「疑似密钥」规则拒了）→ 记在 `memory_absent_attempted_n`，**不算违规** |
+| **召回错** | `expect_memory_wrong_not_used` | 记忆里**确实存在**它，但最终回答**拿它当事实用了** → 违规；<br>回答里提到它、**同一句**有更正措辞（「以本次为准 / 已过时 / 而不是…」）→ 记为「提到但已更正」，**不算违规**；<br>记忆里**根本没有**它 → 陷阱没踩到，**不进分母**（分母只算「确实存在」的，见 `memory_wrong_present_n`） |
+
+**为什么「提到但已更正」不算违规**：正确行为可能是**指出冲突**
+（「记忆里是 D:/old-project，但你这次给的是 D:/work/new-repo，以本次为准」）——
+这句话里确实出现了旧内容，却**没有拿它当事实**。只看「答案里有没有那段文字」会把正确行为判成违规。
+判定用**句级**切分：旧内容所在的那一句里有没有更正标记。
+
+**分母口径**（和其它指标一致，**每个比率都带分母**）：
+- 分母 = **完成（`status=completed`）且取到记忆状态**的运行；
+- 标了记忆标注但**没进分母**的运行（失败的运行，或**没取到记忆状态**的）→ 不进分子也不进分母，
+  单独报 `memory_not_scored_n`（不装作「检查过且通过」）；
+- 失败运行既不进分子也不进分母（与诚实率、拒答率同一套修法）。
+
+**评测集怎么配合**：
+- 记忆类用例**一律跑在临时记忆库**上（`scripts/eval_agent.py` 的 `prepare_memory_env`）——
+  绝不往用户真实的 `data/agent_memory.jsonl` 里写测试数据；
+- 「召回错」用例用 `memory_seed` **预置**一条过时记忆（q57 预置旧项目路径、q58 预置旧语言偏好），
+  否则陷阱根本踩不到、那一项的分母会是 0。
+
+**★ 诚实的边界（这条很重要）**：
+- **只覆盖内容层面，没覆盖召回排序**：判的是「记忆里有没有这段内容」「答案有没有依赖它」，
+  **不判**「BM25 召回的 top-k 顺序对不对」「该注入的有没有被注入」——
+  `memory_injected` 事件只记 key、不记内容，自动注入的**内容**离线复原不了；
+- **「不依赖它」是启发式**：靠「答案里有没有出现 + 同句有没有更正措辞」判断，
+  会有假阳性（模型说「以…为准」但其实在拿旧值当事实）与假阴性（模型用别的措辞说明冲突）；
+- **片段匹配是关键词级的**（`a|b` 多写法、忽略大小写），同义改写会漏判；
+- **记忆是跨任务的，评测是单轮的**：`memory_seed` 只能造出「任务开始时就在记忆里」的情形，
+  「上一个任务写的、这一个任务该用上」的完整链路目前**没有**端到端评测；
+- 记忆类用例**只有 8 条**，且需要真实模型行为才有意义（假模型只能验证链路通不通）。
+
+单测见 `tests/test_memory_eval.py`（**29 条**：三类判定各正反例、trace/快照重算、
+分母口径、旧 50 条零回归、评测集完整性、runner 的记忆隔离、以及一条
+「真跑一次 Agent（假模型 + 真的 `remember_fact` 工具与 JSONL 记忆库）」的端到端用例）。
 
 ---
 
@@ -886,6 +957,7 @@ ground truth 标注，口径与诚实率**完全一致**（分母只算 `status=
 | `action` | 发起一次工具调用（含 `attempt` 序号；重试会出现多条） |
 | `retry` | 一次可重试失败 + 退避秒数 |
 | `observation` | 工具结果：成功给截断预览；失败给 `error_class` 与可操作建议（**带 `ok` / `degraded` → 工具口径可离线重算**） |
+| `memory_ready` / `memory_injected` | 记忆库就绪（路径、条数）/ 任务启动时**自动注入**了几条记忆（`count` / `keys`，★ **只记 key、不记内容**）——记忆评测靠这几类事件 + `remember_fact` / `recall_memory` 的 observation 重算（§5.9.5） |
 | `degrade` / `circuit_open` | 降级 / 熔断触发 |
 | `max_steps_reached` / `run_end` | 收尾：状态、步数（含 `steps_this_run`）、最终回答、指标（`tool_success_rate`、`usage` 用量与成本） |
 
@@ -921,10 +993,10 @@ ground truth 标注，口径与诚实率**完全一致**（分母只算 `status=
 
 ```text
 > .venv\Scripts\python.exe -m pytest -q
-........................................................................ [ 47%]
-....................................s................................... [ 94%]
-........                                                                 [100%]
-151 passed, 1 skipped in 20.26s
+........................................................................ [ 39%]
+.................................................................s...... [ 79%]
+.....................................                                    [100%]
+180 passed, 1 skipped in 19.37s
 ```
 
 把 MCP 端到端用例也打开（它会拉起 rag-mcp-server 子进程并加载 BGE 模型，约 10s）：
@@ -932,14 +1004,14 @@ ground truth 标注，口径与诚实率**完全一致**（分母只算 `status=
 ```text
 > set HELLO_AGENT_TEST_MCP=1
 > .venv\Scripts\python.exe -m pytest -q
-........................................................................ [ 47%]
-........................................................................ [ 94%]
-........                                                                 [100%]
-152 passed in 25.38s
+........................................................................ [ 39%]
+........................................................................ [ 79%]
+.....................................                                    [100%]
+181 passed in 23.21s
 
 > .venv\Scripts\python.exe -m pytest -q -k mcp_form     # 只跑那一条
 .                                                                        [100%]
-1 passed, 151 deselected in 9.13s
+1 passed, 180 deselected in 9.13s
 ```
 
 **测试怎么测一个「概率性系统」**：把模型替换成**脚本化假模型** `tests/fake_llm.py`
@@ -958,6 +1030,8 @@ ground truth 标注，口径与诚实率**完全一致**（分母只算 `status=
 | `tests/test_usage.py` | 单价查表与成本换算**精确值**、usage 抽取（`usage_metadata` / `response_metadata` 两条来源）、无用量时明示、runner 里 token/成本落 metrics 与控制台摘要、扫 trace 求和（累计层）、评测侧聚合成本、**工具结局离线重算与 runner 指标同口径** |
 | `tests/test_checkpoint_resume.py` | **续跑不重放已完成步骤**（sqlite 与自研 JSONL 两个后端同一套断言）、已收尾 thread 开新一轮、不给 thread_id 时完全不启用、显式 sqlite 缺依赖要报错而 auto 才允许降级、JSONL 落盘跨实例回读 |
 | `tests/test_memory.py` | 持久化 / 同 key 覆盖 / 拒绝密钥 / 无重叠不召回 / 工具往返 / 注入截断 / BM25 Recall@1=6/6、**key 子串加权**、**`compact_threshold` 语义与旧键名兼容**、**删除 / 过期 / 来源 / 核验**、**旧格式 JSONL 仍可加载** |
+| `tests/test_eval_scoring.py` | 评测打分口径：严/宽两套工具选择、拒答只算完成、要点命中率、幻觉率、老条目兼容、两个字段名别名 |
+| `tests/test_memory_eval.py` | **记忆评测**：该记/不该记/召回错三类判定（各正反例）、记忆状态从 trace 与记忆库快照重算、**旧 50 条零回归**、评测集完整性、runner 的记忆隔离、以及一条「真跑一次 Agent（假模型 + 真 `remember_fact` 工具 + 真 JSONL 记忆库）」的端到端用例 |
 
 ### CI 门禁（`.github/workflows/ci.yml`）
 
@@ -990,9 +1064,9 @@ python -m pip install -r requirements.txt && python -m pytest -q -rs
 ```
 
 ```text
-# 本机（存在兄弟仓库 rag-mcp-server + BGE 缓存）：151 passed, 1 skipped in 20.26s
-# 本机 + HELLO_AGENT_TEST_MCP=1（把 MCP 端到端也打开）：152 passed in 25.38s
-# runner 上不存在兄弟仓库（= GitHub runner 的真实情形）：147 passed, 5 skipped in 5.05s
+# 本机（存在兄弟仓库 rag-mcp-server + BGE 缓存）：180 passed, 1 skipped in 19.37s
+# 本机 + HELLO_AGENT_TEST_MCP=1（把 MCP 端到端也打开）：181 passed in 23.21s
+# runner 上不存在兄弟仓库（= GitHub runner 的真实情形）：176 passed, 5 skipped in 5.05s
 #   —— 5 个集成用例走测试自带的 skipif 显式跳过（不是失败），见 tests/test_rag_tool.py
 ```
 
@@ -1074,14 +1148,14 @@ hello-agent/
 │   ├── usage_report.py        # 扫 trace 汇总 token / 成本（单次 + 累计，可导出 json/md）
 │   └── eval_agent.py          # 批量评测 CLI（落 eval_results/*.json + *.md）
 ├── data/
-│   └── eval_queries.json      # 50 条评测 query（分类 + 期望工具 + 该不该拒答 + 答案要点 + 幻觉陷阱）
+│   └── eval_queries.json      # 58 条评测 query（分类 + 期望工具 + 该不该拒答 + 答案要点 + 幻觉陷阱 + 记忆三类标注）
 ├── experiments/               # ★ 可复现的对照实验（压缩代价；脚本 + 结果 + 口径说明）
 │   ├── README.md              #   实验设计 / 怎么跑 / 局限
 │   ├── context_compression/   #   压缩开 vs 关：同任务两轮对照
 │   │   ├── run_experiment.py  #     实验 runner（多档位 × 多任务，产出 csv/json/md）
 │   │   └── fake_policy_model.py #    上下文忠实的脚本化假模型（复用 tests/fake_llm.py）
 │   └── results/               #   实测产物：csv（逐任务原始数据）+ json + md（曲线报告）
-├── tests/                     # 151 passed / 1 skipped（+35：评测打分口径 21 + 压缩实验纯逻辑 14；MCP 端到端需设环境变量）
+├── tests/                     # 180 passed / 1 skipped（+64：评测打分口径 21 + 记忆评测 29 + 压缩实验纯逻辑 14；MCP 端到端需设环境变量）
 │                              #   checkpoint / 演示产物落 data/ 已 gitignore
 ├── traces/                    # 真实运行 trace（JSONL，可回放）
 └── docs/
@@ -1105,8 +1179,11 @@ hello-agent/
   **真实模型的语义质量曲线没测**（本机无可用端点）；
 - **本机没有 `.env`/密钥**，所以 §5.7 / §5.8 里的 token 与成本实测数字来自脚本化假模型
   （确定性、可复现），真实端点的端到端跑批留给有 key 的环境；
-- 评测集 **50 条**（原 16 条），覆盖 8 个分类与 4 类工具，规模仍然小，
+- 评测集 **58 条**（原 16 条），覆盖 9 个分类与 4 类工具，规模仍然小，
   指标用于**回归护栏**，不代表线上分布；拒答/幻觉判定是**关键词启发式**，有假阳性（详见 §5.9.4）；
+- **记忆评测只覆盖内容层面**（§5.9.5）：判「记忆里有没有这段内容」「答案有没有依赖它」，
+  **不判召回排序**，也不判「该注入的有没有被注入」（`memory_injected` 事件只记 key、不记内容）；
+  「不依赖它」是词表启发式，有假阳性与假阴性；
 - 每任务新建 MCP 会话，子进程启动 + 预热约 5s 未优化。
 
 **下一步（按优先级）**
@@ -1114,9 +1191,12 @@ hello-agent/
 2. 上下文压缩升级为 LLM 摘要（当前是确定性的占位压缩，保证离线可复现）；
    摘要版要沿用 §5.6.1 的对照实验口径重新量一遍代价（同样任务、同样档位、同样指标）；
 3. MCP 会话复用 / 常驻进程，消除每任务 5s 的启动成本；
-4. 评测集继续扩（50 → 100+），并把分类别的指标（工具选择 / 失败恢复 / 领域外诚实 / 要点命中率）
-   与成本一起看，而不只看总体；关键词打分换成语义判分（LLM-as-Judge，与 rag-eval-platform 那套对齐）；
-5. 续跑再接一层「工具幂等键」（副作用去重），把 checkpoint 从「状态一致」推到「副作用一致」。
+4. 评测集继续扩（58 → 100+），并把分类别的指标（工具选择 / 失败恢复 / 领域外诚实 / 要点命中率 /
+   **记忆三类**）与成本一起看，而不只看总体；关键词打分换成语义判分（LLM-as-Judge，
+   与 rag-eval-platform 那套对齐）；
+5. 续跑再接一层「工具幂等键」（副作用去重），把 checkpoint 从「状态一致」推到「副作用一致」；
+6. 记忆评测补上**召回层**：trace 里记下注入的**内容**（不只 key），并加「跨任务链路」用例
+   （上一个任务写 → 下一个任务该用上），以及 BM25 召回排序的离线指标。
 
 ---
 

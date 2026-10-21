@@ -877,11 +877,16 @@ ground truth 标注，口径与诚实率**完全一致**（分母只算 `status=
 那套测试有自动化门禁：`ubuntu-latest` + Python 3.12 + `pip` 依赖缓存 + `pytest -q -rs`，
 job 级设了离线变量，**不需要密钥、也不会下载模型**。
 
-> **宿主如实说明**：本仓库**同时托管在 Gitee 与 GitHub**（两边是同一份历史、同一批 commit SHA）。
-> **GitHub 侧 Actions 会执行**：每次 push / PR 自动跑一遍测试（本文顶部的徽章是真实运行状态，不是摆设）；
-> Gitee 侧不执行 GitHub Actions（若日后接 Gitee Go 另配）。
-> 这份 YAML 用的是**通用 GitHub Actions 格式**——镜像一份到 GitHub 即可直接生效，但在 Gitee 侧目前不是自动跑的流水线。
-> 因此 README **挂 CI 徽章**：它指向 GitHub Actions 的真实运行状态（仓库已镜像到 GitHub）。
+> **宿主如实说明**：本仓库**同时托管在 Gitee 与 GitHub**（两边是同一份历史、同一批 commit SHA），
+> 而且**两边都接了自动门禁**：
+>
+> - **GitHub Actions**（`.github/workflows/ci.yml`）：每次 push / PR 自动跑一遍测试 —— 本文顶部的徽章就是它的真实运行状态；
+> - **Gitee Go**（`.workflow/MasterPipeline.yml`）：**同一批命令、同一套口径**（含同样的 `--deselect` 排除清单），
+>   每次 push 到 master 自动构建。Gitee Go 的构建记录在仓库页「流水线」里 —— **需要登录才能看到**，
+>   所以这里不挂 Gitee 徽章（匿名访问会被登录墙挡成 404，挂一个坏徽章比不挂更糟）。
+>
+> Gitee Go 那份 YAML 是**照着 GitHub CI 抄的同一批命令**（只有 YAML 方言不同：Gitee Go 用 `step: build@python`，
+> 且**键名大小写敏感**，写错不会在文件里报错、而是流水线直接不生效 —— 这三个坑都写进了 `.workflow/MasterPipeline.yml` 的注释）。
 
 为什么这样设环境变量（每条都对着一个真实坑，不是仪式感）：
 

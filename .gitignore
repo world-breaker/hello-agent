@@ -23,4 +23,7 @@ data/checkpoints.jsonl*
 data/demo_resume*.sqlite*
 data/demo_resume*.jsonl*
 data/demo_resume_traces/
+# 运行期 trace（每次 run_task 都会新生成，不入库）
+traces/
+
 

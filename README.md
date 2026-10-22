@@ -1158,6 +1158,8 @@ hello-agent/
 ├── tests/                     # 180 passed / 1 skipped（+64：评测打分口径 21 + 记忆评测 29 + 压缩实验纯逻辑 14；MCP 端到端需设环境变量）
 │                              #   checkpoint / 演示产物落 data/ 已 gitignore
 ├── traces/                    # 真实运行 trace（JSONL，可回放）
+│                             #   ↑ 仓里保留 12 份实测样本（README 逐个引用其内容）；
+│                             #     新产生的运行 trace 已被 .gitignore 排除，不入库
 └── docs/
     └── 讲解指南.md            # ★ 零基础讲解 + 面试问答模板（含「面试怎么讲」）
 ```

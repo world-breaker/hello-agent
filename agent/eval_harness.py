@@ -997,7 +997,7 @@ def is_refusal(answer: str) -> bool:
 
 
 def render_markdown(summary: Dict[str, Any], records: List[EvalRecord]) -> str:
-    """把评测结果渲染成可贴进 README / 面试材料的 Markdown。"""
+    """把评测结果渲染成可直接贴进 README 的 Markdown。"""
     lines = ["# hello-agent 量化评测报告", ""]
     if summary.get("n"):
         lines.append(f"- 评测条数：**{summary['n']}**")
